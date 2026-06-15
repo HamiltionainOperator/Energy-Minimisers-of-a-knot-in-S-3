@@ -1,0 +1,9 @@
+- Does SpMM_vec have any advantage at all?
+- Check whether copy_buffers harms the performance of SpMM_vec.
+
+- Permute vs. Sparse::BinaryMatrixCSR?
+- PermuteCombine vs. Sparse::BinaryMatrixCSR?
+
+- PermuteCombine -> combine_scatter_write
+
+- combine_scatter_write needs leading dimensions.

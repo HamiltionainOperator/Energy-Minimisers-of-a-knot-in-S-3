@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>S³ Knot Energy — Live</title>
+<style>
+  :root { --bg:#0a0c12; --panel:#141824; --fg:#e8ecf4; --muted:#8a93a6; --accent:#5ad1ff; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+              font-family:-apple-system,Segoe UI,Roboto,sans-serif; overflow:hidden; }
+  #app { display:flex; height:100vh; }
+  #scene { flex:1; position:relative; }
+  #scene canvas { display:block; }
+  #title { position:absolute; top:14px; left:18px; font-size:15px; letter-spacing:.3px;
+           color:var(--muted); pointer-events:none; }
+  #title b { color:var(--fg); }
+  #side { width:340px; background:var(--panel); padding:18px; display:flex; flex-direction:column;
+          gap:16px; border-left:1px solid #232838; }
+  .stat { display:flex; justify-content:space-between; align-items:baseline; }
+  .stat .k { color:var(--muted); font-size:13px; }
+  .stat .v { font-variant-numeric:tabular-nums; font-size:22px; font-weight:600; }
+  #echart { width:100%; height:170px; background:#0e1220; border-radius:8px; }
+  .controls { display:flex; flex-direction:column; gap:10px; margin-top:auto; }
+  .row { display:flex; gap:10px; align-items:center; }
+  button { background:#202637; color:var(--fg); border:1px solid #2d3650; border-radius:7px;
+           padding:8px 12px; font-size:13px; cursor:pointer; }
+  button:hover { background:#27304a; }
+  button.on { background:var(--accent); color:#04222e; border-color:var(--accent); }
+  input[type=range] { width:100%; accent-color:var(--accent); }
+  .hint { color:var(--muted); font-size:12px; line-height:1.5; }
+  #live { display:inline-block; width:8px; height:8px; border-radius:50%; background:#3a4255;
+          margin-right:6px; vertical-align:middle; }
+  #live.on { background:#48e08a; box-shadow:0 0 8px #48e08a; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+}}
+</script>
+</head>
+<body>
+<div id="app">
+  <div id="scene"><div id="title"><b>S³ O'Hara energy</b> &nbsp;—&nbsp; live knot evolution</div></div>
+  <div id="side">
+    <div class="stat"><span class="k">iteration</span><span class="v" id="s-iter">—</span></div>
+    <div class="stat"><span class="k">energy E²<sub>S³</sub></span><span class="v" id="s-energy">—</span></div>
+    <canvas id="echart"></canvas>
+    <div class="controls">
+      <div class="row">
+        <button id="b-live" class="on"><span id="live" class="on"></span>Follow live</button>
+        <button id="b-play">▶ Play</button>
+        <button id="b-rot" class="on">⟳ Auto-spin</button>
+      </div>
+      <input type="range" id="scrub" min="0" max="0" value="0" />
+      <div class="hint">Drag to rotate · scroll to zoom · right-drag to pan.
+        Frames stream in as the optimizer runs.</div>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ── three.js scene ────────────────────────────────────────────────────────
+const host = document.getElementById('scene');
+const renderer = new THREE.WebGLRenderer({ antialias:true });
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+host.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0a0c12);
+const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 100);
+camera.position.set(0, 0, 3.2);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true; controls.autoRotateSpeed = 1.6;
+scene.add(new THREE.AmbientLight(0x8090b0, 0.7));
+const d1 = new THREE.DirectionalLight(0xffffff, 1.5); d1.position.set(2,3,4); scene.add(d1);
+const d2 = new THREE.DirectionalLight(0x5ad1ff, 0.7); d2.position.set(-3,-1,-2); scene.add(d2);
+
+let tubeMesh = null;
+const mat = new THREE.MeshStandardMaterial({ metalness:0.45, roughness:0.3, vertexColors:true });
+
+function resize() {
+  const w = host.clientWidth, h = host.clientHeight;
+  renderer.setSize(w,h); camera.aspect = w/h; camera.updateProjectionMatrix();
+}
+addEventListener('resize', resize); resize();
+
+// Build a tube through the (centered+scaled) frame points, coloured along its length.
+function setKnot(flatPts) {
+  const n = flatPts.length/3;
+  const pts = [];
+  let cx=0,cy=0,cz=0;
+  for (let i=0;i<n;i++){ cx+=flatPts[3*i]; cy+=flatPts[3*i+1]; cz+=flatPts[3*i+2]; }
+  cx/=n; cy/=n; cz/=n;
+  let r=0;
+  for (let i=0;i<n;i++){
+    const x=flatPts[3*i]-cx, y=flatPts[3*i+1]-cy, z=flatPts[3*i+2]-cz;
+    r=Math.max(r, Math.hypot(x,y,z));
+  }
+  const s = r>1e-9 ? 1.0/r : 1.0;
+  for (let i=0;i<n;i++)
+    pts.push(new THREE.Vector3((flatPts[3*i]-cx)*s, (flatPts[3*i+1]-cy)*s, (flatPts[3*i+2]-cz)*s));
+  const curve = new THREE.CatmullRomCurve3(pts, true, 'catmullrom', 0.5);
+  const geo = new THREE.TubeGeometry(curve, Math.max(64,n), 0.028, 12, true);
+  // colour by position along the tube (hue sweep) for depth cues
+  const cols = [];
+  const pos = geo.attributes.position;
+  const seg = geo.parameters.tubularSegments;
+  const col = new THREE.Color();
+  for (let i=0;i<pos.count;i++){
+    const t = (Math.floor(i/( (geo.parameters.radialSegments)+1 ))/seg);
+    col.setHSL(0.55 - 0.45*t, 0.7, 0.55);
+    cols.push(col.r, col.g, col.b);
+  }
+  geo.setAttribute('color', new THREE.Float32BufferAttribute(cols,3));
+  if (tubeMesh){ tubeMesh.geometry.dispose(); tubeMesh.geometry = geo; }
+  else { tubeMesh = new THREE.Mesh(geo, mat); scene.add(tubeMesh); }
+}
+
+// ── frame store + energy chart ────────────────────────────────────────────
+const frames = [];          // {i, e, p:[...]}
+let cur = -1, follow = true, playing = false;
+const ec = document.getElementById('echart'), ectx = ec.getContext('2d');
+function drawChart() {
+  const w = ec.width = ec.clientWidth*devicePixelRatio, h = ec.height = ec.clientHeight*devicePixelRatio;
+  ectx.clearRect(0,0,w,h);
+  if (!frames.length) return;
+  const es = frames.map(f=>f.e), is = frames.map(f=>f.i);
+  const emin=Math.min(...es), emax=Math.max(...es), imax=Math.max(...is,1);
+  const pad=10*devicePixelRatio;
+  const X=i=>pad+(w-2*pad)*(i/imax), Y=e=>h-pad-(h-2*pad)*((e-emin)/((emax-emin)||1));
+  ectx.strokeStyle='#5ad1ff'; ectx.lineWidth=2*devicePixelRatio; ectx.beginPath();
+  frames.forEach((f,k)=>{ const x=X(f.i),y=Y(f.e); k?ectx.lineTo(x,y):ectx.moveTo(x,y); });
+  ectx.stroke();
+  if (cur>=0){ const f=frames[cur];
+    ectx.fillStyle='#fff'; ectx.beginPath(); ectx.arc(X(f.i),Y(f.e),3.5*devicePixelRatio,0,7); ectx.fill(); }
+}
+
+const sIter=document.getElementById('s-iter'), sEnergy=document.getElementById('s-energy');
+const scrub=document.getElementById('scrub');
+function show(k){
+  if (k<0||k>=frames.length) return;
+  cur=k; const f=frames[k];
+  setKnot(f.p);
+  sIter.textContent=f.i; sEnergy.textContent=f.e.toFixed(3);
+  scrub.value=k; drawChart();
+}
+function addFrame(f){
+  frames.push(f); scrub.max=frames.length-1;
+  if (follow) show(frames.length-1); else drawChart();
+}
+
+// ── controls ──────────────────────────────────────────────────────────────
+const bLive=document.getElementById('b-live'), bPlay=document.getElementById('b-play'),
+      bRot=document.getElementById('b-rot'), liveDot=document.getElementById('live');
+bLive.onclick=()=>{ follow=!follow; bLive.classList.toggle('on',follow); liveDot.classList.toggle('on',follow);
+                    if(follow) show(frames.length-1); };
+bRot.onclick=()=>{ controls.autoRotate=!controls.autoRotate; bRot.classList.toggle('on',controls.autoRotate); };
+controls.autoRotate=true;
+bPlay.onclick=()=>{ playing=!playing; follow=false; bLive.classList.remove('on'); liveDot.classList.remove('on');
+                    bPlay.textContent=playing?'⏸ Pause':'▶ Play'; };
+scrub.oninput=()=>{ follow=false; bLive.classList.remove('on'); liveDot.classList.remove('on'); show(+scrub.value); };
+
+let acc=0;
+function loop(t){
+  controls.update();
+  if (playing && frames.length){ acc++; if(acc%3===0){ let k=cur+1; if(k>=frames.length){k=0;} show(k); } }
+  renderer.render(scene,camera);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+// ── live stream via SSE ─────────────────────────────────────────────────────
+const es = new EventSource('/stream');
+es.onmessage = (ev)=>{ try{ addFrame(JSON.parse(ev.data)); }catch(e){} };
+es.addEventListener('done', ()=>{ liveDot.classList.remove('on'); });
+addEventListener('resize', drawChart);
+</script>
+</body>
+</html>

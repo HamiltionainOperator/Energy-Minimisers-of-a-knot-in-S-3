@@ -1,0 +1,551 @@
+/**
+ * energy_s3.cpp  (fast version)
+ *
+ * Tangent-point energy flow for knots on S³.
+ *
+ * Gradient strategy
+ * -----------------
+ *   n < 50  : TangentPointEnergy_AllPairs  (Repulsor, O(n²) exact BVH pass)
+ *   n ≥ 50  : TangentPointEnergy0          (Repulsor Barnes-Hut, O(n log n))
+ *   Both compute energy + analytic gradient in one traversal pass.
+ *   The result lives in ℝ⁴; we project it onto T_{x_k}S³ after.
+ *
+ * Sobolev preconditioning
+ * -----------------------
+ *   TangentPointMetric0::Solve solves  (A * g_sob = g_l2)  via preconditioned
+ *   GMRES, where A is the H^{1/2} tangent-point metric.  This makes each
+ *   descent step resolution-independent.
+ *
+ * Energy (Armijo check / logging)
+ * --------------------------------
+ *   Custom geodesic TPE with d_{S³}(x,y) = arccos(clamp(<x,y>, -1, 1)).
+ *   Repulsor uses Euclidean chord distance in ℝ⁴ for its kernel; the custom
+ *   geodesic energy is the mathematically correct one and is used for all
+ *   convergence decisions.
+ *
+ * Retraction
+ * ----------
+ *   x_k ← normalize( exp_{x_k}(−α · g_sob[k]) ),  k = 0…n−1.
+ *
+ * Opening angle for Barnes-Hut
+ * ----------------------------
+ *   far_field_separation_parameter = 0.5  (≈ θ = 0.5 opening angle).
+ *
+ * Compile:
+ *   clang++ -std=c++20 -O3 -fenable-matrix -pthread \
+ *     -I/Users/yash/knot-s3/Repulsor \
+ *     -I/Users/yash/knot-s3/Repulsor/submodules/Tensors \
+ *     -framework Accelerate \
+ *     energy_s3.cpp -o energy_s3
+ */
+
+// ─── macOS Accelerate / OpenBLAS ───────────────────────────────────────────
+#ifdef __APPLE__
+#include "submodules/Tensors/Accelerate.hpp"
+#else
+#include "submodules/Tensors/OpenBLAS.hpp"
+#endif
+
+// ─── Repulsor ───────────────────────────────────────────────────────────────
+#include "Repulsor.hpp"
+
+// ─── STL ────────────────────────────────────────────────────────────────────
+#include <algorithm>
+#include <cassert>
+#include <cmath>
+#include <cstdint>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+using namespace Tools;
+
+using Int = std::int32_t;
+using LInt = std::int64_t;
+using Real = double;
+
+using Mesh_T = Repulsor::SimplicialMeshBase<Real, Int, LInt>;
+using Energy_T = Repulsor::EnergyBase<Mesh_T>;
+using Metric_T = Repulsor::MetricBase<Mesh_T>;
+
+static constexpr int DOM_DIM = 1; // line segments
+static constexpr int AMB_DIM = 4; // ambient ℝ⁴ (S³ ⊂ ℝ⁴)
+static constexpr Real TPE_Q =
+    3.0; // tangent-point exponent q  (matches "repel_curve 3 6")
+static constexpr Real TPE_P = 6.0;    // tangent-point exponent p
+static constexpr Real BH_THETA = 0.5; // Barnes-Hut opening angle
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §1  S³ geometry utilities
+// ═══════════════════════════════════════════════════════════════════════════
+
+static constexpr Real EPS = 1e-14;
+
+inline Real dot4(const Real *a, const Real *b) noexcept {
+  return a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
+}
+inline Real norm2_4(const Real *a) noexcept { return dot4(a, a); }
+inline Real norm_4(const Real *a) noexcept { return std::sqrt(norm2_4(a)); }
+
+inline void normalise4(Real *a) noexcept {
+  Real n = norm_4(a);
+  if (n > EPS) {
+    a[0] /= n;
+    a[1] /= n;
+    a[2] /= n;
+    a[3] /= n;
+  }
+}
+
+/** Geodesic distance on S³: arccos(clamp(<x,y>,-1,1)). */
+inline Real geodesic_dist(const Real *x, const Real *y) noexcept {
+  Real d = std::max(-1.0, std::min(1.0, dot4(x, y)));
+  return std::acos(d);
+}
+
+/**
+ * Unit log-map from x toward y.  Stores unit direction in out[4].
+ * Returns the geodesic distance θ = d(x,y).
+ */
+inline Real log_unit(const Real *x, const Real *y, Real *out) noexcept {
+  Real c = std::max(-1.0, std::min(1.0, dot4(x, y)));
+  Real theta = std::acos(c);
+  // tangent component of y at x:  v = y - c*x
+  Real v[4] = {y[0] - c * x[0], y[1] - c * x[1], y[2] - c * x[2],
+               y[3] - c * x[3]};
+  Real n = norm_4(v);
+  if (n > EPS) {
+    out[0] = v[0] / n;
+    out[1] = v[1] / n;
+    out[2] = v[2] / n;
+    out[3] = v[3] / n;
+  } else {
+    out[0] = out[1] = out[2] = out[3] = 0.0;
+  }
+  return theta;
+}
+
+/** exp_x(v) — retraction on S³. */
+inline void exp_map(const Real *x, const Real *v, Real *out) noexcept {
+  Real nv = norm_4(v);
+  if (nv < EPS) {
+    out[0] = x[0];
+    out[1] = x[1];
+    out[2] = x[2];
+    out[3] = x[3];
+    return;
+  }
+  Real c = std::cos(nv), s = std::sin(nv);
+  for (int k = 0; k < 4; ++k)
+    out[k] = c * x[k] + s * v[k] / nv;
+}
+
+/** Orthogonal projection of v onto T_x S³. */
+inline void proj_tangent(const Real *x, const Real *v, Real *out) noexcept {
+  Real c = dot4(v, x);
+  for (int k = 0; k < 4; ++k)
+    out[k] = v[k] - c * x[k];
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §2  Stereographic projection  ℝ³ ↔ S³
+// ═══════════════════════════════════════════════════════════════════════════
+
+inline void r3_to_s3(const Real *y, Real *x) noexcept {
+  Real r2 = y[0] * y[0] + y[1] * y[1] + y[2] * y[2];
+  Real d = 1.0 / (r2 + 1.0);
+  x[0] = 2.0 * y[0] * d;
+  x[1] = 2.0 * y[1] * d;
+  x[2] = 2.0 * y[2] * d;
+  x[3] = (r2 - 1.0) * d;
+}
+
+inline void s3_to_r3(const Real *x, Real *y) {
+  Real denom = 1.0 - x[3];
+  if (std::fabs(denom) < EPS)
+    throw std::runtime_error("s3_to_r3: near north pole");
+  y[0] = x[0] / denom;
+  y[1] = x[1] / denom;
+  y[2] = x[2] / denom;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §3  File I/O
+// ═══════════════════════════════════════════════════════════════════════════
+
+std::vector<Real> read_vect(const std::string &path, int &n_out) {
+  std::ifstream f(path);
+  if (!f)
+    throw std::runtime_error("Cannot open: " + path);
+  int nc;
+  f >> nc;
+  if (nc != 1)
+    std::cerr << "Warning: " << nc << " components; using first only.\n";
+  int n;
+  f >> n;
+  std::vector<Real> pts(n * 3);
+  for (int i = 0; i < n; ++i)
+    f >> pts[3 * i] >> pts[3 * i + 1] >> pts[3 * i + 2];
+  n_out = n;
+  return pts;
+}
+
+void write_vect(const std::string &path, const std::vector<Real> &pts_r3,
+                int n) {
+  std::ofstream f(path);
+  if (!f)
+    throw std::runtime_error("Cannot write: " + path);
+  f << "1\n" << n << "\n" << std::setprecision(10) << std::fixed;
+  for (int i = 0; i < n; ++i)
+    f << pts_r3[3 * i] << " " << pts_r3[3 * i + 1] << " " << pts_r3[3 * i + 2]
+      << "\n";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §4  Geodesic tangent-point energy (custom, for Armijo + logging)
+//     d_{S³} = arccos(clamp(<x_i, x_j>, -1, 1))
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Vertex-based geodesic TPE:
+ *   E = Σ_{k≠l, |k-l|>1} (1 - <T_k, D_{kl}>²) / d_{kl}^4 · w_k · w_l
+ *
+ * T_k = unit geodesic tangent at x_k toward x_{k+1}
+ * D_{kl} = unit geodesic direction from x_k to x_l
+ * d_{kl} = arccos(<x_k, x_l>)
+ * w_k = (L_{k-1} + L_k)/2  (Voronoi weight, L_k = edge geodesic length)
+ */
+Real compute_energy_geodesic(const std::vector<Real> &v4, int n) {
+  // Pre-compute tangents and weights
+  std::vector<Real> T(n * 4), L(n), w(n);
+  for (int k = 0; k < n; ++k) {
+    int kp = (k + 1) % n;
+    Real tdir[4];
+    L[k] = log_unit(v4.data() + 4 * k, v4.data() + 4 * kp, tdir);
+    for (int d = 0; d < 4; ++d)
+      T[4 * k + d] = tdir[d];
+  }
+  for (int k = 0; k < n; ++k)
+    w[k] = (L[(k - 1 + n) % n] + L[k]) * 0.5;
+
+  Real E = 0.0;
+  for (int k = 0; k < n; ++k) {
+    const Real *xk = v4.data() + 4 * k;
+    const Real *Tk = T.data() + 4 * k;
+    for (int l = 0; l < n; ++l) {
+      int diff = std::abs(k - l);
+      if (diff <= 1 || diff == n - 1)
+        continue;
+      const Real *xl = v4.data() + 4 * l;
+      Real Dkl[4];
+      Real d = log_unit(xk, xl, Dkl);
+      if (d < EPS)
+        continue;
+      Real c = dot4(Tk, Dkl);
+      Real sin2 = 1.0 - c * c;
+      if (sin2 < 0.0)
+        sin2 = 0.0;
+      E += sin2 / (d * d * d * d) * w[k] * w[l];
+    }
+  }
+  return E * 0.5; // ordered pairs counted twice
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §5  Repulsor mesh construction
+// ═══════════════════════════════════════════════════════════════════════════
+
+std::unique_ptr<Mesh_T> build_mesh(
+    Repulsor::SimplicialMesh_Factory<Mesh_T, DOM_DIM, DOM_DIM, AMB_DIM, AMB_DIM>
+        &fac,
+    const std::vector<Real> &v4, int n, int threads = 1) {
+  std::vector<Int> simplices(n * 2);
+  for (int i = 0; i < n; ++i) {
+    simplices[2 * i] = i;
+    simplices[2 * i + 1] = (i + 1) % n;
+  }
+
+  auto M = fac.Make(v4.data(), n, AMB_DIM, false, simplices.data(), n,
+                    DOM_DIM + 1, false, threads);
+  auto &m = *M;
+  m.cluster_tree_settings.split_threshold = 2;
+  m.block_cluster_tree_settings.far_field_separation_parameter = BH_THETA;
+  m.adaptivity_settings.theta = 10.0;
+  return M;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §6  Gradient descent on S³
+// ═══════════════════════════════════════════════════════════════════════════
+
+void gradient_descent(std::vector<Real> &v4, // in/out: S³ vertices [n×4]
+                      int n, const std::string &log_path, int max_iter,
+                      Real alpha0) {
+  // ── Repulsor factories ────────────────────────────────────────────────
+  Repulsor::SimplicialMesh_Factory<Mesh_T, DOM_DIM, DOM_DIM, AMB_DIM, AMB_DIM>
+      mesh_fac;
+
+  // Energy: AllPairs for n<50, Barnes-Hut (TangentPointEnergy0) for n≥50
+  Repulsor::TangentPointEnergy_AllPairs_Factory<Mesh_T, DOM_DIM, DOM_DIM,
+                                                AMB_DIM, AMB_DIM>
+      tpe_ap_fac;
+  Repulsor::TangentPointEnergy0_Factory<Mesh_T, DOM_DIM, DOM_DIM, AMB_DIM,
+                                        AMB_DIM>
+      tpe_bh_fac;
+
+  // Sobolev H^{1/2} metric
+  Repulsor::TangentPointMetric0_Factory<Mesh_T, DOM_DIM, DOM_DIM, AMB_DIM,
+                                        AMB_DIM>
+      tpm_fac;
+
+  auto tpe_ap_ptr = tpe_ap_fac.Make(DOM_DIM, AMB_DIM, TPE_Q, TPE_P);
+  auto tpe_bh_ptr = tpe_bh_fac.Make(DOM_DIM, AMB_DIM, TPE_Q, TPE_P);
+  auto tpm_ptr = tpm_fac.Make(DOM_DIM, AMB_DIM, TPE_Q, TPE_P);
+
+  auto &E_ap = *tpe_ap_ptr; // AllPairs energy (small n)
+  auto &E_bh = *tpe_bh_ptr; // BH energy (large n)
+  auto &metric = *tpm_ptr;  // Sobolev H^{1/2} metric
+
+  const int thread_count = 1;
+  auto mesh_ptr = build_mesh(mesh_fac, v4, n, thread_count);
+  auto &M = *mesh_ptr;
+
+  // ── Gradient buffers ─────────────────────────────────────────────────
+  Mesh_T::CotangentVector_T diff(n, AMB_DIM);  // L² gradient (cotangent)
+  Mesh_T::TangentVector_T g_sob(n, AMB_DIM);   // Sobolev gradient
+  Mesh_T::TangentVector_T new_pos(n, AMB_DIM); // updated coordinates
+
+  // ── Log file ─────────────────────────────────────────────────────────
+  std::ofstream log(log_path);
+  if (!log)
+    throw std::runtime_error("Cannot write: " + log_path);
+  log << "iteration,energy,gradient_norm,step_size\n";
+  log << std::setprecision(12) << std::scientific;
+
+  Real alpha = alpha0;
+
+  // ── Constants and scratch buffers hoisted outside the iteration loop ─────
+  constexpr Real ARMIJO_C = 1e-4;   // sufficient-decrease constant
+  constexpr Real ALPHA_MIN = 1e-15; // step-size floor
+  constexpr int MAX_BT = 50;        // max backtracking halvings
+
+  // Scratch buffer used inside the Armijo loop to capture the discarded
+  // gradient from the non-caching Differential call.
+  Mesh_T::CotangentVector_T e_buf(n, AMB_DIM);
+
+  for (int iter = 0; iter <= max_iter; ++iter) {
+
+    // ── 1. Geodesic energy (exact, for Armijo + logging) ─────────────
+    Real E = compute_energy_geodesic(v4, n);
+
+    // ── 2. Analytic L² gradient via Repulsor BVH ─────────────────────
+    //   AllPairs for n < 50, Barnes-Hut (TangentPointEnergy0) for n ≥ 50.
+    //   Euclidean in ℝ⁴ — close to geodesic for well-spread points on S³.
+    Real E_rep;
+    if (n < 50)
+      E_rep = E_ap.Differential(M, diff.data());
+    else
+      E_rep = E_bh.Differential(M, diff.data());
+
+    // Project diff onto T_{x_k}S³  (Repulsor gradient lives in ℝ⁴)
+    for (int k = 0; k < n; ++k) {
+      Real tmp[4];
+      proj_tangent(v4.data() + 4 * k, diff.data() + 4 * k, tmp);
+      for (int d = 0; d < 4; ++d)
+        diff.data()[4 * k + d] = tmp[d];
+    }
+
+    Real gnorm = 0.0;
+    for (int i = 0; i < n * AMB_DIM; ++i)
+      gnorm += diff.data()[i] * diff.data()[i];
+    gnorm = std::sqrt(gnorm);
+
+    log << iter << "," << E << "," << gnorm << "," << alpha << "\n";
+
+    if (iter % 50 == 0 || iter == max_iter)
+      std::cout << "iter " << std::setw(5) << iter
+                << "  E_geo=" << std::setprecision(8) << E << "  |g|=" << gnorm
+                << "  α=" << alpha << "\n";
+
+    if (gnorm < 1e-10 || iter == max_iter)
+      break;
+
+    // ── 3. Sobolev H^{1/2} preconditioning ───────────────────────────
+    //   Solve:  metric * g_sob = diff
+    //   g_sob is the Sobolev gradient; convergence is resolution-independent.
+    const Int solver_iter = 100;
+    const Real solver_tol = 1e-5;
+
+    metric.Solve(M, Real(1), diff.data(), AMB_DIM, Real(0), g_sob.data(),
+                 AMB_DIM, AMB_DIM, solver_iter, solver_tol);
+
+    // Project g_sob onto T_{x_k}S³
+    for (int k = 0; k < n; ++k) {
+      Real tmp[4];
+      proj_tangent(v4.data() + 4 * k, g_sob.data() + 4 * k, tmp);
+      for (int d = 0; d < 4; ++d)
+        g_sob.data()[4 * k + d] = tmp[d];
+    }
+
+    // ── 4. Armijo backtracking line search ────────────────────────────
+    //
+    // CRITICAL: compare like-for-like.
+    //   diff   = gradient of the REPULSOR Euclidean TPE (from step 2)
+    //   g_sob  = Sobolev-preconditioned version of diff
+    //   descent = <diff, g_sob> > 0  (guaranteed for pos-def metric)
+    //
+    // We must check sufficient decrease in the SAME functional whose
+    // gradient we are using.  Using geodesic energy here is wrong because
+    // descent > 0 says nothing about the geodesic functional — the Armijo
+    // condition would fail every iteration and alpha would halve to zero.
+    //
+    // Correct pattern (matches Repulsor Example2/main.cpp):
+    //   1. build trial coords via exp_map + normalize onto S³
+    //   2. M.SemiStaticUpdate(trial_coords)  ← BVH now at trial point
+    //   3. E_trial = energy.Differential(M, buf, /*add=*/false)
+    //      — non-caching overload forces a fresh BVH traversal;
+    //        any stale "::Value" cache from step 2 is bypassed
+    //   4. Armijo: E_trial <= E_rep − c · alpha · descent
+    //   5. reject → restore BVH, halve alpha
+    //   6. min-step guard: accept rather than halving to machine zero
+
+    // descent = <diff, g_sob>  in L² (always > 0 for pos-def metric)
+    Real descent = 0.0;
+    for (int i = 0; i < n * AMB_DIM; ++i)
+      descent += diff.data()[i] * g_sob.data()[i];
+
+    std::vector<Real> v4_save = v4;
+    std::vector<Real> v4_cand(n * 4);
+    Real alpha_try = alpha;
+    bool accepted = false;
+
+    for (int bt = 0; bt < MAX_BT; ++bt) {
+
+      // 1. trial point: exp_map(-alpha_try · g_sob) then project to S³
+      for (int k = 0; k < n; ++k) {
+        Real pk[4], step[4], q[4];
+        for (int d = 0; d < 4; ++d)
+          pk[d] = v4_save[4 * k + d];
+        for (int d = 0; d < 4; ++d)
+          step[d] = -alpha_try * g_sob.data()[4 * k + d];
+        exp_map(pk, step, q);
+        normalise4(q);
+        for (int d = 0; d < 4; ++d)
+          v4_cand[4 * k + d] = q[d];
+      }
+
+      // 2. push trial coords into Repulsor mesh + update BVH
+      //    (SemiStaticUpdate is designed for line-search use — Example2)
+      for (int i = 0; i < n * AMB_DIM; ++i)
+        new_pos.data()[i] = v4_cand[i];
+      M.SemiStaticUpdate(new_pos.data());
+
+      // 3. evaluate Repulsor energy at trial point
+      Real E_trial;
+      if (n < 50)
+        E_trial = E_ap.Value(M);
+      else
+        E_trial = E_bh.Value(M);
+
+      // 4. sufficient decrease: E_trial <= E_rep - c * alpha_try * descent
+      if (E_trial <= E_rep - ARMIJO_C * alpha_try * descent) {
+        v4 = v4_cand; // BVH is already at v4_cand
+        accepted = true;
+        // cautious step-size growth on success
+        alpha = std::min(alpha_try * 1.2, alpha0 * 10.0);
+        break;
+      }
+
+      // 5. halve and check minimum guard
+      alpha_try *= 0.5;
+      if (alpha_try < ALPHA_MIN) {
+        // Step is smaller than machine precision can represent.
+        // Restore mesh to original coordinates and keep alpha small
+        // but finite so the next iteration can try again.
+        for (int i = 0; i < n * AMB_DIM; ++i)
+          new_pos.data()[i] = v4_save[i];
+        M.SemiStaticUpdate(new_pos.data());
+        v4 = v4_save;    // no update this iteration
+        accepted = true; // break out cleanly
+        alpha = alpha0;  // reset step to initial for recovery
+        break;
+      }
+    }
+
+    if (!accepted) {
+      // Exhausted MAX_BT without ALPHA_MIN (shouldn't happen).
+      for (int i = 0; i < n * AMB_DIM; ++i)
+        new_pos.data()[i] = v4_save[i];
+      M.SemiStaticUpdate(new_pos.data());
+      v4 = v4_save;
+      alpha = alpha_try;
+    }
+  }
+
+  log.close();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §7  main
+// ═══════════════════════════════════════════════════════════════════════════
+
+int main(int argc, char **argv) {
+  Profiler::Clear();
+
+  if (argc < 4) {
+    std::cerr << "Usage: energy_s3 <input.vect> <energy_log.csv> <output.vect>"
+                 " [max_iter=500] [step=0.01]\n";
+    return 1;
+  }
+
+  const std::string in_path = argv[1];
+  const std::string log_path = argv[2];
+  const std::string out_path = argv[3];
+  const int max_iter = (argc >= 5) ? std::stoi(argv[4]) : 5000;
+  const Real alpha0 = (argc >= 6) ? std::stod(argv[5]) : 0.01;
+
+  std::cout << "S³ Tangent-Point Energy Minimiser  (fast)\n";
+  std::cout << "═══════════════════════════════════════════\n";
+  std::cout << "  Input    : " << in_path << "\n";
+  std::cout << "  Log      : " << log_path << "\n";
+  std::cout << "  Output   : " << out_path << "\n";
+  std::cout << "  Max iter : " << max_iter << "\n";
+  std::cout << "  α₀       : " << alpha0 << "\n";
+  std::cout << "  BH θ     : " << BH_THETA << "  (n≥50)\n\n";
+
+  // Load .vect (R³)
+  int n = 0;
+  std::vector<Real> pts_r3 = read_vect(in_path, n);
+  std::cout << "Loaded " << n << " vertices.\n";
+  std::cout << (n >= 50 ? "Using Barnes-Hut (TangentPointEnergy0).\n"
+                        : "Using AllPairs   (TangentPointEnergy_AllPairs).\n");
+
+  // Lift to S³ via inverse stereographic projection
+  std::vector<Real> v4(n * 4);
+  for (int i = 0; i < n; ++i)
+    r3_to_s3(pts_r3.data() + 3 * i, v4.data() + 4 * i);
+
+  Real E0 = compute_energy_geodesic(v4, n);
+  std::cout << "Initial geodesic energy: " << std::setprecision(10) << E0
+            << "\n\n";
+
+  // Run
+  gradient_descent(v4, n, log_path, max_iter, alpha0);
+
+  Real Ef = compute_energy_geodesic(v4, n);
+  std::cout << "\nFinal geodesic energy : " << std::setprecision(10) << Ef
+            << "\n";
+  std::cout << "Reduction             : " << std::setprecision(4) << E0 / Ef
+            << "×  (" << 100.0 * (1.0 - Ef / E0) << "% decrease)\n";
+
+  // Project back to R³ and write
+  for (int i = 0; i < n; ++i)
+    s3_to_r3(v4.data() + 4 * i, pts_r3.data() + 3 * i);
+  write_vect(out_path, pts_r3, n);
+  std::cout << "Written: " << out_path << "\n";
+  return 0;
+}

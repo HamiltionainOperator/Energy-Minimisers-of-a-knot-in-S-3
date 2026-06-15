@@ -1,0 +1,358 @@
+// Testing the Cholesky solver.
+
+// TODO: Test whether slicing (i.e., the use of leading dimensions) works.
+
+#include <iostream>
+
+//#undef _OPENMP
+
+#define TOOLS_ENABLE_PROFILER
+//#define TOOLS_DEBUG
+//#define TOOLS_AGGRESSIVE_INLINING
+
+#ifdef __APPLE__
+    #include "../Accelerate.hpp"
+#else
+    #include "../OpenBLAS.hpp"
+#endif
+
+#include "Tensors.hpp"
+#include "Sparse.hpp"
+
+#include "../src/Sparse/ApproximateMinimumDegree.hpp"
+#include "../src/Sparse/Metis.hpp"
+
+using namespace Tools;
+using namespace Tensors;
+
+using Scal   = double;
+using Real   = Scalar::Real<Scal>;
+
+using LInt   = long;
+using Int    = int32_t;
+
+constexpr bool use_metisQ = false;
+//constexpr bool use_metisQ = true;
+
+constexpr Parallel_T parQ = Parallel;
+
+int main()
+{
+    constexpr Int thread_count = 8;
+    
+    Profiler::Clear();
+    
+    print("");
+    print("###############################################################");
+    print("###     Test program for Sparse::CholeskyDecomposition     ####");
+    print("###############################################################");
+    print("");
+    
+    Int grid_size = 1024 * 2;
+    constexpr Int NRHS = 8;
+    const     Int nrhs = NRHS;
+    
+    
+    TOOLS_DUMP(grid_size);
+    TOOLS_DUMP(nrhs);
+    TOOLS_DUMP(TypeName<Scal>);
+    TOOLS_DUMP(TypeName<Int>);
+    TOOLS_DUMP(TypeName<LInt>);
+    TOOLS_DUMP(use_metisQ);
+    
+    tic("Assemble matrix");
+    Sparse::MatrixCSR<Scal,Int,LInt,parQ> A = Sparse::GridLaplacian<Scal,Int,LInt>(grid_size,Real(1),thread_count);
+    toc("Assemble matrix");
+    
+    TOOLS_DUMP(A.ProvenInnerSortedQ());
+    TOOLS_DUMP(A.ProvenDuplicateFreeQ());
+    TOOLS_DUMP(A.RowCount());
+    TOOLS_DUMP(A.ColCount());
+    TOOLS_DUMP(A.NonzeroCount());
+    
+    const Int n = A.RowCount();
+    
+    Tensor1<Scal,Int> b (n);
+    Tensor1<Scal,Int> x (n);
+    
+    Tensor2<Scal,Int> B (n,nrhs);
+    Tensor2<Scal,Int> X (n,nrhs);
+
+    const Int ldB = nrhs;
+    const Int ldX = nrhs;
+    const Int ldY = ldB;
+    
+    const Scal alpha     = 1;
+    const Scal alpha_inv = Frac<Scal>(1,alpha);
+    const Scal beta      = 0;
+    
+    b.Random();
+    B.Random();
+
+    Tensor1<Scal,Int> y;
+    Tensor2<Scal,Int> Y;
+
+    Scal reg = 0.;
+    
+    print("");
+    print("");
+    print("== Tensors::Sparse:CholeskyDecomposition == ");
+    print("");
+    {
+        Permutation<Int,Parallel> perm;
+        
+        if constexpr ( use_metisQ )
+        {
+            tic("Metis");
+            perm = Sparse::Metis<Int,parQ>()(
+                A.Outer().data(), A.Inner().data(), A.RowCount(), thread_count
+            );
+            toc("Metis");
+        }
+        else
+        {
+            tic("AMD");
+            perm = Sparse::ApproximateMinimumDegree<Int,parQ>()(
+                A.Outer().data(), A.Inner().data(), A.RowCount(), thread_count
+            );
+            toc("AMD");
+        }
+        
+        using Cholesky_T = Sparse::CholeskyDecomposition<Scal,Int,LInt,parQ>;
+        
+        
+        tic("Cholesky constructor");
+        Cholesky_T S ( A.Outer().data(), A.Inner().data(), std::move(perm) );
+        toc("Cholesky constructor");
+        
+        print("");
+        
+        tic("Cholesky symbolic");
+//        S.SetSupernodeStrategy( Cholesky_T::SupernodeStrategy_T::Maximal );
+        S.SetSupernodeStrategy( Cholesky_T::SupernodeStrategy_T::Fundamental);
+//        S.SetSupernodeStrategy( Cholesky_T::SupernodeStrategy_T::Amalgamated);
+        TOOLS_DUMP(S.GetSupernodeStrategy());
+        S.SymbolicFactorization();
+        toc("Cholesky symbolic");
+        
+        TOOLS_DUMP(S.GetSupernodeStrategy());
+        TOOLS_DUMP(S.RequiredTriangularSize());
+        TOOLS_DUMP(S.RequiredRectangularSize());
+        
+        print("");
+        S.AssemblyTree().Traverse_PostOrdered_Test();
+        print("");
+        
+        tic("Cholesky numeric factorization");
+            S.SetFactorizationMethod( Cholesky_T::FactorizationMethod_T::Multifrontal );
+//        S.SetFactorizationMethod(( Cholesky_T::FactorizationMethod_T::LeftLooking  );
+        S.NumericFactorization(A.Values().data(), reg);
+        toc("Cholesky numeric factorization");
+        TOOLS_DUMP(S.GetFactorizationMethod());
+        TOOLS_DUMP(S.NumericallyFactorizedQ());
+        TOOLS_DUMP(S.NumericallyGoodQ());
+        
+        Cholesky_T::NumericalFactorization_T external_factorization;
+        TOOLS_DUMP(external_factorization.AllocatedByteCount());
+        
+        print("");
+        print("Swapping container for numerical factorization to invalid one.");
+        S.SwapNumericalFactorization(external_factorization);
+        TOOLS_DUMP(external_factorization.AllocatedByteCount());
+        TOOLS_DUMP(S.NumericallyFactorizedQ());
+        TOOLS_DUMP(S.NumericallyGoodQ());
+        
+        print("");
+        print("Swapping container for numerical factorization back to the valid one.");
+        S.SwapNumericalFactorization(external_factorization);
+        TOOLS_DUMP(external_factorization.AllocatedByteCount());
+        TOOLS_DUMP(S.NumericallyFactorizedQ());
+        TOOLS_DUMP(S.NumericallyGoodQ());
+
+        print("");
+        print("Swapping container for numerical factorization to invalid one.");
+        S.SwapNumericalFactorization(external_factorization);
+        TOOLS_DUMP(external_factorization.AllocatedByteCount());
+        TOOLS_DUMP(S.NumericallyFactorizedQ());
+        TOOLS_DUMP(S.NumericallyGoodQ());
+        
+        print("");
+        tic("Cholesky numeric factorization");
+            S.NumericFactorization(A.Values().data(), reg);
+        toc("Cholesky numeric factorization");
+        TOOLS_DUMP(S.NumericallyFactorizedQ());
+        TOOLS_DUMP(S.NumericallyGoodQ());
+        
+        print("");
+        print("Sequential solves");
+        print("");
+        
+        x.SetZero();
+        tic("Cholesky sequential vector solve -- Tensor1 arguments");
+        S.Solve<1,Sequential>( alpha, b.data(), 1, beta, x.data(), 1 );
+        toc("Cholesky sequential vector solve -- Tensor1 arguments");
+        y = b;
+        A.Dot( -alpha_inv, x, Scal(1), y);
+        TOOLS_DUMP(y.MaxNorm());
+        
+        print("");
+        
+        x.SetZero();
+        tic("Cholesky sequential vector solve -- pointer arguments");
+        S.Solve<1,Sequential>( alpha, b.data(), 1, beta, x.data(), 1, 1 );
+        toc("Cholesky sequential vector solve -- pointer arguments");
+        y = b;
+        A.Dot<1>( -alpha_inv, x.data(), 1, Scal(1), y.data(), 1);
+        TOOLS_DUMP(y.MaxNorm());
+        
+        print("");
+        
+        X.SetZero();
+        tic("Cholesky sequential matrix solve -- Tensor2 arguments");
+        S.Solve<VarSize,Sequential>( alpha, B, beta, X );
+        toc("Cholesky sequential matrix solve -- Tensor2 arguments");
+        Y = B;
+        A.Dot<VarSize>( -alpha_inv, X, Scal(1), Y );
+        TOOLS_DUMP(Y.MaxNorm());
+        
+        print("");
+        
+        X.SetZero();
+        tic("Cholesky sequential matrix solve -- pointer arguments");
+        S.Solve<NRHS,Sequential>( alpha, B.data(), ldB, beta, X.data(), ldX, nrhs);
+        toc("Cholesky sequential matrix solve -- pointer arguments");
+        Y = B;
+        A.Dot<NRHS>( -alpha_inv, X.data(), ldX, Scal(1), Y.data(), ldY, nrhs );
+        TOOLS_DUMP(Y.MaxNorm());
+        
+        print("");
+        print("Parallel solves");
+        print("");
+        
+        x.SetZero();
+        tic("Cholesky parallel vector solve -- Tensor1 arguments");
+        S.Solve<Parallel>( alpha, b, beta, x );
+        toc("Cholesky parallel vector solve -- Tensor1 arguments");
+        y = b;
+        A.Dot( -alpha_inv, x, Scal(1), y);
+        TOOLS_DUMP(y.MaxNorm());
+        
+        print("");
+        
+        x.SetZero();
+        tic("Cholesky parallel vector solve -- pointer arguments");
+        S.Solve<1,Parallel>( alpha, b.data(), 1, beta, x.data(), 1 );
+        toc("Cholesky parallel vector solve -- pointer arguments");
+        y = b;
+        A.Dot( -alpha_inv, x, Scal(1), y);
+        TOOLS_DUMP(y.MaxNorm());
+        
+        print("");
+        
+        X.SetZero();
+        tic("Cholesky parallel matrix solve -- Tensor2 arguments");
+        S.Solve<VarSize,Parallel>( alpha, B, beta, X);
+        toc("Cholesky parallel matrix solve -- Tensor2 arguments");
+        Y = B;
+        A.Dot( -alpha_inv, X, Scal(1), Y );
+        TOOLS_DUMP(Y.MaxNorm());
+        
+        print("");
+        
+        X.SetZero();
+        tic("Cholesky parallel matrix solve -- pointer arguments");
+        S.Solve<NRHS,Parallel>( alpha, B.data(), ldB, beta, X.data(), ldX, nrhs);
+        toc("Cholesky parallel matrix solve -- pointer arguments");
+        Y = B;
+        A.Dot<NRHS>( -alpha_inv, X.data(), ldX, Scal(1), Y.data(), ldY, nrhs );
+        TOOLS_DUMP(Y.MaxNorm());
+    }
+#define TEST_ACCELERATE
+    
+#ifdef TEST_ACCELERATE
+    print("");
+    print("");
+    print("== Accelerate == ");
+    print("");
+    {
+        SparseMatrixStructure pat = {
+            A.RowCount(), A.ColCount(), A.Outer().data(), A.Inner().data(),
+            SparseAttributes_t{ false, SparseUpperTriangle, SparseSymmetric, 0, false },
+            1
+        };
+
+        SparseMatrix_Double AA = { pat, A.Values().data() };
+
+        Tensor2<Scal,Int> BT ( B.Dim(1), B.Dim(0));
+
+        BT.ReadTransposed(B.data());
+
+        SparseSymbolicFactorOptions opts = _SparseDefaultSymbolicFactorOptions;
+        
+//        enum class SparseOrder : uint8_t
+//        {
+//          SparseOrderDefault = 0,
+//          SparseOrderUser = 1,
+//          SparseOrderAMD = 2,
+//          SparseOrderMetis = 3,
+//          SparseOrderCOLAMD = 4,
+//        );
+//        opts.orderMethod = SparseOrderDefault;
+//        opts.orderMethod = SparseOrderAMD;
+//        opts.orderMethod = SparseOrderMetis;
+//        opts.orderMethod = SparseOrderUser;
+//        opts.order = const_cast<Int*>(perm.GetPermutation().data());
+        
+        if constexpr ( use_metisQ )
+        {
+            opts.orderMethod = SparseOrderMetis;
+        }
+        else
+        {
+            opts.orderMethod = SparseOrderAMD;
+        }
+        
+        tic("Accelerate symbolic factorization");
+        SparseOpaqueSymbolicFactorization Lsym = SparseFactor( 
+            SparseFactorizationCholesky, 
+            pat,
+            opts
+        );
+        toc("Accelerate symbolic factorization");
+
+        print("");
+
+        tic("Accelerate numeric factorization");
+        SparseOpaqueFactorization_Double L = SparseFactor( Lsym, AA );
+        toc("Accelerate numeric factorization");
+
+        print("");
+
+        tic("Accelerate Cholesky vector solve");
+        SparseSolve( L,
+            DenseVector_Double{ b.Dim(0), b.data() },
+            DenseVector_Double{ x.Dim(0), x.data() }
+        );
+        toc("Accelerate Cholesky vector solve");
+        y = b;
+        A.Dot(Scal(-1), x, Scal(1), y);
+        TOOLS_DUMP(y.MaxNorm());
+
+        print("");
+
+        tic("Accelerate Cholesky matrix solve");
+        SparseSolve( L,
+            DenseMatrix_Double{
+                B.Dim(0), B.Dim(1), B.Dim(0), SparseAttributes_t(), BT.data()
+            }
+        );
+        BT.WriteTransposed(X.data());
+        toc("Accelerate Cholesky matrix solve");
+        Y = B;
+        A.Dot(Scal(-1), X, Scal(1), Y);
+        TOOLS_DUMP(Y.MaxNorm());
+    }
+#endif // TEST_ACCELERATE
+    
+    return 0;
+}

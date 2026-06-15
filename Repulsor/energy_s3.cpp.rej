@@ -1,0 +1,8 @@
+@@ -402,6 +402,7 @@
+                 E_trial = E_bh.Value(M);
+ 
+             // 4. sufficient decrease: E_trial <= E_rep - c * alpha_try * descent
++            // std::cout << "  [Armijo] E_rep=" << E_rep << " E_trial=" << E_trial << " descent=" << descent << " alpha=" << alpha_try << "\n";
+             if (E_trial <= E_rep - ARMIJO_C * alpha_try * descent) {
+                 v4       = v4_cand;  // BVH is already at v4_cand
+ 
