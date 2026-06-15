@@ -13,7 +13,7 @@ The energy and its exact analytic $\mathbb{R}^4$ gradient are computed directly 
 * **Stereographic Lifting**: Generates $T(p,q)$ torus knots in $\mathbb{R}^3$ and lifts them to $S^3$.
 * **Sobolev Preconditioning**: Uses an $H^{1/2}$ preconditioned metric for resolution-independent gradient descent.
 * **Exact analytic gradient**: Multithreaded $O(N^2)$ evaluation of $E^{(2)}_{S^3}$ and its exact gradient (FD-validated), with an $O(N^2)$ difference-array treatment of the arc-length term.
-* **Torus knots & connect sums**: Generates $T(p,q)$ torus knots and arbitrary connect sums $T(p_1,q_1)\#T(p_2,q_2)\#\cdots\#T(p_n,q_n)$ of them.
+* **Torus knots & connect sums**: Generates $T(p,q)$ torus knots and arbitrary connect sums \(T(p_1,q_1)\sharp T(p_2,q_2)\sharp\cdots\sharp T(p_n,q_n)\) of them.
 * **Robust topological verification**: Computes the knot **determinant** by majority vote over random projections (`analysis/knot_check.py`), so a degenerate projection can't mislabel a knot as the unknot. A connect sum's determinant must equal the *product* of its components'.
 * **Live 3D viewer**: A browser viewer (three.js) that streams the knot deforming in real time as the optimizer runs — rotate, zoom, scrub the timeline.
 * **Automated Pipeline**: A single `make` command drives generation, energy minimization, plotting, and rendering.
