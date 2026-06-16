@@ -97,6 +97,15 @@ static int G_THREADS = 1;         // set in main from hardware_concurrency
 static int FRAME_EVERY = 0;       // --frames K: dump a trajectory frame every K
                                   // iterations for the live viewer (0 = off)
 static std::string TRAJ_PATH;     // where the trajectory JSONL is written
+static int REPARAM_EVERY = 50;    // --reparam K: re-uniformise arc length every K
+                                  // iterations (0 = off; for collapse diagnosis)
+static bool NORMALIZE = true;     // --no-normalize: skip the ℝ³ centre+RMS-scale
+                                  // step before the S³ lift. That step is an ℝ³
+                                  // similarity (NOT an S³ isometry), so it distorts
+                                  // a knot already generated on S³ (torus knots);
+                                  // skipping it starts T(p,q) on the pristine
+                                  // Clifford torus.  Composites (generated in ℝ³ at
+                                  // large scale) still want it ON.
 
 inline Real dot4(const Real *a, const Real *b) noexcept {
   return a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
@@ -162,6 +171,100 @@ inline void proj_tangent(const Real *x, const Real *v, Real *out) noexcept {
   Real c = dot4(v, x);
   for (int k = 0; k < 4; ++k)
     out[k] = v[k] - c * x[k];
+}
+
+/**
+ * Redistribute the n vertices to EQUAL geodesic arc length along the curve,
+ * interpolating along the existing geodesic edges (slerp) so every new vertex
+ * stays on S³ and the geometric curve is unchanged — only the parametrisation.
+ *
+ * The energy's gradient has a tangential component that slides vertices and
+ * clusters them; left alone, a point-starved arc becomes too coarse to hold its
+ * shape and a connect-sum summand collapses into a tiny coil. Re-parametrising
+ * periodically keeps the resolution uniform so every part of the knot stays
+ * intact.  Vertex 0 is held fixed as the arc-length origin.
+ */
+void reparametrize_s3(std::vector<Real> &v4, int n) {
+  // Distribute the n vertices uniformly in the CURVATURE-ADAPTIVE measure
+  //   dμ = ds + λ·dκ   (arc length + a turning term),  NOT pure arc length.
+  //
+  // Pure-arc-length reparametrisation hands a summand vertices in proportion to
+  // its arc length, so a shrinking connect-sum summand is progressively starved
+  // of points until it is too coarse to hold its crossings and unties — verified
+  // empirically: arc-length reparam collapses T(2,3)#T(2,3) from det 9 to det 3
+  // (a single trefoil, E 130→54), while disabling reparam preserves det 9. This
+  // term fixes that without losing the anti-clustering benefit: a summand's total
+  // turning stays ≈constant as it shrinks (its topology is fixed) while its arc
+  // length →0, so the curvature term gives every summand a size-INDEPENDENT floor
+  // of vertices (with CURV_WEIGHT=1, ≈25% per summand of a two-summand knot).
+  // For a uniform-curvature curve (torus knot) the turning is spread evenly, so
+  // the measure is ∝ arc length and this reduces to the old behaviour.
+  constexpr Real CURV_WEIGHT = 1.0;   // curvature's share of the measure ≈ the floor
+
+  std::vector<Real> L(n);             // geodesic edge lengths
+  std::vector<Real> turn(n, 0.0);     // turning angle at each vertex
+  Real total_arc = 0.0;
+  for (int k = 0; k < n; ++k) {
+    int kp = (k + 1) % n;
+    Real c = std::max(-1.0, std::min(1.0, dot4(v4.data() + 4 * k,
+                                               v4.data() + 4 * kp)));
+    L[k] = std::acos(c);
+    total_arc += L[k];
+  }
+  if (total_arc < EPS) return;
+
+  // Turning angle at vertex k = angle between the ℝ⁴ chord edges e_{k-1}, e_k.
+  Real total_turn = 0.0;
+  for (int k = 0; k < n; ++k) {
+    int km = (k - 1 + n) % n, kp = (k + 1) % n;
+    Real e0[4], e1[4];
+    for (int d = 0; d < 4; ++d) {
+      e0[d] = v4[4 * k + d]  - v4[4 * km + d];
+      e1[d] = v4[4 * kp + d] - v4[4 * k + d];
+    }
+    Real n0 = norm_4(e0), n1 = norm_4(e1);
+    if (n0 > EPS && n1 > EPS) {
+      Real cc = std::max(-1.0, std::min(1.0, dot4(e0, e1) / (n0 * n1)));
+      turn[k] = std::acos(cc);
+    }
+    total_turn += turn[k];
+  }
+  Real lambda = (total_turn > EPS) ? CURV_WEIGHT * total_arc / total_turn : 0.0;
+
+  // Per-edge weighted measure: arc length + half the turning at each endpoint.
+  std::vector<Real> cumW(n + 1);
+  cumW[0] = 0.0;
+  for (int k = 0; k < n; ++k) {
+    int kp = (k + 1) % n;
+    cumW[k + 1] = cumW[k] + L[k] + lambda * 0.5 * (turn[k] + turn[kp]);
+  }
+  Real Wtot = cumW[n];
+  if (Wtot < EPS) return;
+
+  std::vector<Real> out(n * 4);
+  int j = 0;
+  for (int i = 0; i < n; ++i) {
+    Real target = (Real)i * Wtot / n;
+    while (j < n - 1 && cumW[j + 1] <= target) ++j;
+    // Within an edge the measure is ≈uniform, so the weighted fraction is also
+    // the geodesic arc-length fraction used by the slerp below.
+    Real wj = cumW[j + 1] - cumW[j];
+    Real t = (wj > EPS) ? (target - cumW[j]) / wj : 0.0;
+    Real th = L[j];
+    const Real *a = v4.data() + 4 * j;
+    const Real *b = v4.data() + 4 * ((j + 1) % n);
+    Real *o = out.data() + 4 * i;
+    if (th < 1e-9) {
+      for (int d = 0; d < 4; ++d) o[d] = a[d];
+    } else {
+      Real sn = std::sin(th);
+      Real w0 = std::sin((1.0 - t) * th) / sn;
+      Real w1 = std::sin(t * th) / sn;
+      for (int d = 0; d < 4; ++d) o[d] = w0 * a[d] + w1 * b[d];
+    }
+    normalise4(o);
+  }
+  v4.swap(out);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -472,6 +575,211 @@ inline Real seg_seg_dist2(const Real *A, const Real *B,
     diff[d] = P[d] - Q[d];
   }
   return dot4(diff, diff);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §4c  Continuous collision detection (CCD) in ℝ³
+//
+// Knotting lives in the stereographic ℝ³ image, not in the ℝ⁴ chord metric, so
+// the only rigorous self-avoidance test projects to ℝ³ and asks: as the curve
+// moves linearly from its old to its trial position, do any two non-adjacent
+// edges PASS THROUGH each other?  We reject the trial step iff some edge pair
+// has a time-of-impact t∈(0,1].  This forbids the crossing event itself, so it
+// is tunnel-proof at any step size and never freezes (arbitrarily close
+// approaches are fine as long as nothing passes through).
+// ═══════════════════════════════════════════════════════════════════════════
+
+inline void sub3(const Real *a, const Real *b, Real *o) {
+  o[0] = a[0]-b[0]; o[1] = a[1]-b[1]; o[2] = a[2]-b[2];
+}
+inline void cross3(const Real *a, const Real *b, Real *o) {
+  o[0] = a[1]*b[2]-a[2]*b[1]; o[1] = a[2]*b[0]-a[0]*b[2]; o[2] = a[0]*b[1]-a[1]*b[0];
+}
+inline Real dot3(const Real *a, const Real *b) {
+  return a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+}
+
+// Min distance² between segments [P,P+u] and [Q,Q+v] in ℝ³ (clamped params).
+inline Real seg_seg_dist2_r3(const Real *P, const Real *u,
+                             const Real *Q, const Real *v) {
+  Real w0[3]; sub3(P, Q, w0);
+  Real a = dot3(u, u), b = dot3(u, v), c = dot3(v, v);
+  Real d = dot3(u, w0), e = dot3(v, w0);
+  Real D = a*c - b*b, s, t;
+  if (D < 1e-12) { s = 0.0; t = (c > 1e-12) ? e/c : 0.0; }
+  else { s = (b*e - c*d)/D; t = (a*e - b*d)/D; }
+  s = std::max(0.0, std::min(1.0, s));
+  t = std::max(0.0, std::min(1.0, t));
+  Real dd = 0.0;
+  for (int k = 0; k < 3; ++k) {
+    Real diff = w0[k] + s*u[k] - t*v[k];
+    dd += diff*diff;
+  }
+  return dd;
+}
+
+// Do moving edges (A,B) and (C,D) — each vertex linearly interpolated from its
+// "0" to its "1" position — cross in ℝ³ during t∈(0,1]?  Coplanarity is a cubic
+// in t; we sample for sign changes, bisect to each root, and confirm the
+// segments actually meet there (distance below `tol`).
+bool edge_edge_ccd(const Real *A0, const Real *B0, const Real *C0, const Real *D0,
+                   const Real *A1, const Real *B1, const Real *C1, const Real *D1,
+                   Real tol) {
+  auto cop = [&](Real t) {
+    Real A[3], B[3], C[3], Dp[3], e1[3], e2[3], e3[3], cr[3];
+    for (int k = 0; k < 3; ++k) {
+      A[k]  = A0[k] + t*(A1[k]-A0[k]);
+      B[k]  = B0[k] + t*(B1[k]-B0[k]);
+      C[k]  = C0[k] + t*(C1[k]-C0[k]);
+      Dp[k] = D0[k] + t*(D1[k]-D0[k]);
+    }
+    sub3(B, A, e1); sub3(Dp, C, e2); sub3(C, A, e3);
+    cross3(e1, e2, cr);
+    return dot3(cr, e3);
+  };
+  auto crosses_at = [&](Real t) {
+    Real A[3], u[3], C[3], v[3], B[3], Dp[3];
+    for (int k = 0; k < 3; ++k) {
+      A[k]  = A0[k] + t*(A1[k]-A0[k]);
+      B[k]  = B0[k] + t*(B1[k]-B0[k]);
+      C[k]  = C0[k] + t*(C1[k]-C0[k]);
+      Dp[k] = D0[k] + t*(D1[k]-D0[k]);
+    }
+    sub3(B, A, u); sub3(Dp, C, v);
+    return seg_seg_dist2_r3(A, u, C, v) < tol*tol;
+  };
+  const int S = 8;
+  Real tp = 0.0, fp = cop(0.0);
+  for (int s = 1; s <= S; ++s) {
+    Real t = (Real)s / S, ft = cop(t);
+    if (fp == 0.0 || fp*ft < 0.0) {
+      Real lo = tp, hi = t, flo = fp;
+      for (int b = 0; b < 24; ++b) {
+        Real mid = 0.5*(lo+hi), fm = cop(mid);
+        if (flo*fm <= 0.0) hi = mid; else { lo = mid; flo = fm; }
+      }
+      Real tr = 0.5*(lo+hi);
+      if (tr > 1e-9 && crosses_at(tr)) return true;
+    }
+    tp = t; fp = ft;
+  }
+  return false;
+}
+
+// Pick a unit ℝ⁴ direction `p` that stays far (geodesically) from EVERY vertex
+// of both configurations, so the stereographic projection used by the CCD below
+// is well-conditioned. Projecting from the fixed north pole (0,0,0,1) is the bug
+// that let connect-sums tunnel: whenever a strand wandered near that pole its ℝ³
+// image flew off toward infinity, the linear y0→y1 interpolation no longer
+// tracked the true S³ motion, and the displacement-budget prune under-counted
+// the motion — so a genuine self-passage near the pole slipped through. We
+// instead choose the pole in the curve's emptiest direction (minimise
+// max_i⟨p,x_i⟩ over a fixed candidate set; the curve is 1-D in S³ so almost
+// every direction is empty), guaranteeing 1−⟨p,x_i⟩ is bounded away from 0.
+static void choose_far_pole(const std::vector<Real> &v4a,
+                            const std::vector<Real> &v4b, int n, Real *p) {
+  static const Real cand[][4] = {
+      {1, 0, 0, 0},    {-1, 0, 0, 0},   {0, 1, 0, 0},    {0, -1, 0, 0},
+      {0, 0, 1, 0},    {0, 0, -1, 0},   {0, 0, 0, 1},    {0, 0, 0, -1},
+      {0.5, 0.5, 0.5, 0.5},   {-0.5, 0.5, 0.5, 0.5},  {0.5, -0.5, 0.5, 0.5},
+      {0.5, 0.5, -0.5, 0.5},  {0.5, 0.5, 0.5, -0.5},  {-0.5, -0.5, 0.5, 0.5},
+      {0.5, -0.5, -0.5, 0.5}, {-0.5, 0.5, -0.5, 0.5},
+  };
+  const int NC = (int)(sizeof(cand) / sizeof(cand[0]));
+  Real best = 1e30;
+  int best_k = 0;
+  for (int k = 0; k < NC; ++k) {
+    Real worst = -1e30;
+    for (int i = 0; i < n; ++i) {
+      worst = std::max(worst, std::max(dot4(cand[k], v4a.data() + 4 * i),
+                                       dot4(cand[k], v4b.data() + 4 * i)));
+    }
+    if (worst < best) { best = worst; best_k = k; }
+  }
+  for (int d = 0; d < 4; ++d) p[d] = cand[best_k][d];
+}
+
+// True iff any non-adjacent edge pair crosses while the curve moves from v4_old
+// to v4_new (both S³ vertices; compared in the ℝ³ stereographic projection).
+bool any_self_passage(const std::vector<Real> &v4_old,
+                      const std::vector<Real> &v4_new, int n) {
+  // Project both configurations to ℝ³ from a pole chosen far from the curve.
+  // The Householder reflection H (= I − 2 vvᵀ/|v|², v = p − e₄) maps the chosen
+  // pole p ↦ e₄ = (0,0,0,1); reflections preserve crossings, so projecting the
+  // H-rotated coordinates from e₄ is equivalent to projecting the originals from
+  // p, but reuses the standard formula. denom = 1 − (Hx)₃ = 1 − ⟨p,x⟩ is then
+  // bounded away from 0 for every vertex (no pole blow-up).
+  Real p[4];
+  choose_far_pole(v4_old, v4_new, n, p);
+  Real vv[4] = {p[0], p[1], p[2], p[3] - 1.0};
+  Real vn2 = dot4(vv, vv);
+  std::vector<Real> y0(n*3), y1(n*3);
+  auto proj = [&](const std::vector<Real> &v4, std::vector<Real> &y) {
+    for (int i = 0; i < n; ++i) {
+      const Real *x = v4.data() + 4*i;
+      Real hx[4];
+      if (vn2 > 1e-12) {
+        Real c = 2.0 * dot4(vv, x) / vn2;
+        for (int d = 0; d < 4; ++d) hx[d] = x[d] - c * vv[d];
+      } else {
+        for (int d = 0; d < 4; ++d) hx[d] = x[d];
+      }
+      Real denom = 1.0 - hx[3];
+      if (std::fabs(denom) < 1e-6) denom = (denom < 0 ? -1e-6 : 1e-6);
+      y[3*i+0] = hx[0]/denom; y[3*i+1] = hx[1]/denom; y[3*i+2] = hx[2]/denom;
+    }
+  };
+  proj(v4_old, y0); proj(v4_new, y1);
+
+  // Per-vertex ℝ³ displacement, and a tolerance scaled to the mean edge.
+  Real mean_edge = 0.0;
+  for (int i = 0; i < n; ++i) {
+    int ip = (i+1)%n;
+    Real e[3]; sub3(y0.data()+3*ip, y0.data()+3*i, e);
+    mean_edge += std::sqrt(dot3(e,e));
+  }
+  mean_edge /= n;
+  const Real tol = 1e-4 * mean_edge;
+  std::vector<Real> disp(n);
+  for (int i = 0; i < n; ++i) {
+    Real d[3]; sub3(y1.data()+3*i, y0.data()+3*i, d);
+    disp[i] = std::sqrt(dot3(d,d));
+  }
+
+  const int SKIP = 3;
+  const int nt = std::clamp((n*n)/200000, 1, G_THREADS);
+  std::atomic<bool> hit{false};
+  auto worker = [&](int tid) {
+    for (int i = tid; i < n && !hit.load(std::memory_order_relaxed); i += nt) {
+      int ip = (i+1)%n;
+      for (int j = i+SKIP; j < n; ++j) {
+        int jp = (j+1)%n;
+        if (j-i < SKIP || n-(j-i) < SKIP) continue;
+        if (i == 0 && jp == 0) continue;
+        // Prune: if the two edges' closest static distance exceeds the total
+        // motion of all four endpoints, they cannot pass through this step.
+        Real ui[3], vj[3];
+        sub3(y0.data()+3*ip, y0.data()+3*i, ui);
+        sub3(y0.data()+3*jp, y0.data()+3*j, vj);
+        Real d2 = seg_seg_dist2_r3(y0.data()+3*i, ui, y0.data()+3*j, vj);
+        Real budget = disp[i]+disp[ip]+disp[j]+disp[jp];
+        if (std::sqrt(d2) > budget) continue;
+        if (edge_edge_ccd(y0.data()+3*i, y0.data()+3*ip, y0.data()+3*j, y0.data()+3*jp,
+                          y1.data()+3*i, y1.data()+3*ip, y1.data()+3*j, y1.data()+3*jp,
+                          tol)) {
+          hit.store(true, std::memory_order_relaxed);
+          return;
+        }
+      }
+    }
+  };
+  if (nt == 1) worker(0);
+  else {
+    std::vector<std::thread> pool;
+    for (int t = 0; t < nt; ++t) pool.emplace_back(worker, t);
+    for (auto &th : pool) th.join();
+  }
+  return hit.load();
 }
 
 /**
@@ -809,7 +1117,21 @@ void gradient_descent(std::vector<Real> &v4, // in/out: S³ vertices [n×4]
   constexpr Real STEP_CAP_FRAC = 0.25;
   Real g_min = 0.0; // global min non-adjacent strand gap (this iterate)
 
+  // Re-parametrise to uniform geodesic arc length every REPARAM_EVERY steps
+  // (global; --reparam K, 0 = off).  Uniform arc length undoes tangential
+  // point-clustering, but for a connect-sum it STARVES a shrinking summand of
+  // vertices (it gets points ∝ its arc length), which is what lets it drop
+  // below the resolution needed to hold its crossings and untie.
+
   for (int iter = 0; iter <= max_iter; ++iter) {
+
+    if (REPARAM_EVERY > 0 && iter > 0 && iter % REPARAM_EVERY == 0) {
+      reparametrize_s3(v4, n);
+      for (int i = 0; i < n * AMB_DIM; ++i) new_pos.data()[i] = v4[i];
+      M.SemiStaticUpdate(new_pos.data());
+      std::fill(mom.begin(), mom.end(), 0.0);
+      E = compute_energy_ohara(v4, n);
+    }
 
     // avg edge length (for diagnostics) + global strand gap (for the cap)
     avg_edge_len = 0.0;
@@ -886,33 +1208,35 @@ void gradient_descent(std::vector<Real> &v4, // in/out: S³ vertices [n×4]
         g_sob.data()[4 * k + d] = tmp[d];
     }
 
-    // ── 3b. Compute Maximum Displacement ─────────────────────────────
-    // Find the vertex that will move the fastest.
-    Real max_g_sob = 0.0;
-    for (int k = 0; k < n; ++k) {
-      Real g_norm = norm_4(g_sob.data() + 4 * k);
-      if (g_norm > max_g_sob) max_g_sob = g_norm;
-    }
-
     // ── 4. Backtracking line search on the O'Hara energy ──────────────
     //
     // Sufficient decrease is enforced on E^{(2)}_{S³} directly:
     //   E(trial) <= E - c · α · <∇E, g_sob>.
-    // diff = ∇E (the exact O'Hara gradient) and g_sob = A⁻¹∇E, so the slope
-    // <diff, g_sob> = <∇E, A⁻¹∇E> > 0 for the pos-def preconditioner A — a
-    // true descent slope for the very functional being decreased. When no
-    // step size decreases E any more, backtracking exhausts and we declare
-    // convergence rather than letting the energy creep up.
-
-    // descent = <∇E, g_sob>  (always > 0 for pos-def metric)
+    // diff = ∇E (the exact O'Hara gradient), g_sob = A⁻¹∇E.  For a positive-
+    // definite metric <∇E, g_sob> > 0 is guaranteed — but the preconditioned
+    // GMRES solve can return a non-descent direction when the metric is badly
+    // ill-conditioned (e.g. a tight connect-sum neck).  That is a SOLVER
+    // failure, not convergence: fall back to the raw projected gradient, which
+    // is always a descent direction (<∇E, ∇E> = |∇E|² > 0), so the flow keeps
+    // going instead of stalling at a pinched configuration.
     Real descent = 0.0;
     for (int i = 0; i < n * AMB_DIM; ++i)
       descent += diff.data()[i] * g_sob.data()[i];
 
     if (descent <= 0.0) {
-      std::cout << "\n  *** CONVERGED at iter " << iter
-                << " (no descent direction: <g, g_sob> <= 0) ***\n";
-      break;
+      for (int i = 0; i < n * AMB_DIM; ++i)
+        g_sob.data()[i] = diff.data()[i];   // fall back to steepest descent
+      descent = gnorm * gnorm;              // = <∇E, ∇E> > 0
+      if (iter % 50 == 0)
+        std::cout << "  [precond fallback: H^{1/2} solve non-descent; "
+                     "using raw gradient]\n";
+    }
+
+    // ── 4a. Compute maximum displacement (after any fallback) ─────────
+    Real max_g_sob = 0.0;
+    for (int k = 0; k < n; ++k) {
+      Real g_norm = norm_4(g_sob.data() + 4 * k);
+      if (g_norm > max_g_sob) max_g_sob = g_norm;
     }
 
     std::vector<Real> v4_cand(n * 4);
@@ -995,16 +1319,13 @@ void gradient_descent(std::vector<Real> &v4, // in/out: S³ vertices [n×4]
           continue;
         }
 
-        // ── Tunnel guard (rigorous) ────────────────────────────────────
-        // The displacement cap above usually keeps strands well separated,
-        // but it is not airtight once momentum accumulates. This backstop
-        // forbids any accepted step from more than HALVING the closest
-        // non-adjacent strand gap. Then the gap can only ever shrink toward
-        // zero geometrically (0.5ᵏ·g_min) — it can never reach it — so the
-        // discrete curve provably never passes through itself, while the
-        // relative (not absolute) threshold lets the flow keep tightening
-        // indefinitely without the freeze the old static CCD suffered.
-        if (global_min_gap(v4_cand, n) < 0.5 * g_min) {
+        // ── Tunnel guard: ℝ³ continuous collision detection (rigorous) ──
+        // Reject the step iff some non-adjacent edge pair would pass THROUGH
+        // another as the curve moves from v4 to v4_cand (tested in the ℝ³
+        // stereographic image, where knotting actually lives — the old ℝ⁴-chord
+        // gap test let crossings slip through). Forbidding the crossing event
+        // itself is tunnel-proof at any step size and never freezes.
+        if (any_self_passage(v4, v4_cand, n)) {
           alpha_try *= 0.5;
           continue;
         }
@@ -1071,8 +1392,9 @@ int main(int argc, char **argv) {
   // Parse flags anywhere in args: --ccd, --gradcheck, --frames K
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
-    if (a == "--ccd" || a == "--gradcheck") {
+    if (a == "--ccd" || a == "--gradcheck" || a == "--no-normalize") {
       if (a == "--ccd") CCD_ENABLED = true;
+      else if (a == "--no-normalize") NORMALIZE = false;
       else gradcheck = true;
       for (int j = i; j < argc - 1; ++j) argv[j] = argv[j + 1];
       --argc;
@@ -1080,6 +1402,13 @@ int main(int argc, char **argv) {
     } else if (a == "--frames") {
       // Consume the flag AND its integer argument.
       FRAME_EVERY = (i + 1 < argc) ? std::max(1, std::atoi(argv[i + 1])) : 10;
+      int consume = (i + 1 < argc) ? 2 : 1;
+      for (int j = i; j < argc - consume; ++j) argv[j] = argv[j + consume];
+      argc -= consume;
+      --i;
+    } else if (a == "--reparam") {
+      // Consume the flag AND its integer argument (0 = disable reparametrisation).
+      REPARAM_EVERY = (i + 1 < argc) ? std::max(0, std::atoi(argv[i + 1])) : 50;
       int consume = (i + 1 < argc) ? 2 : 1;
       for (int j = i; j < argc - consume; ++j) argv[j] = argv[j + consume];
       argc -= consume;
@@ -1166,7 +1495,16 @@ int main(int argc, char **argv) {
   // well-spread band around the equator (empirically maximises the strand gap;
   // for an N=1000 Granny this enlarges the gap ~11×).  Knot type and the energy
   // minimiser are unchanged — only the starting placement and convergence speed.
-  {
+  //
+  // BUT this is an ℝ³ similarity, NOT an S³ isometry: it distorts a knot that was
+  // already generated on S³.  A torus knot T(p,q) is built on the Clifford torus
+  // (uniform, symmetric, x₄∈[−0.707,0.707]) and projected to ℝ³; the lift below
+  // inverts the projection EXACTLY, so without this step it lands back on the
+  // pristine Clifford torus.  With it, the curve comes back distorted (edge
+  // spread 1.0→1.5, strand gap shrunk ~20%, pushed off-centre) — a worse start.
+  // So: skip it for torus knots (`--no-normalize`); keep it for the ℝ³-scale
+  // composites that genuinely need re-placing near the equator.
+  if (NORMALIZE) {
     Real c[3] = {0, 0, 0};
     for (int i = 0; i < n; ++i)
       for (int d = 0; d < 3; ++d) c[d] += pts_r3[3 * i + d];
@@ -1184,6 +1522,9 @@ int main(int argc, char **argv) {
         pts_r3[3 * i + d] = (pts_r3[3 * i + d] - c[d]) * s;
     std::cout << "Normalised R³ placement: centroid removed, RMS radius "
               << std::setprecision(4) << rms << " → 1.0\n";
+  } else {
+    std::cout << "R³ normalisation SKIPPED (--no-normalize): "
+                 "lifting input straight to S³ (pristine Clifford torus).\n";
   }
 
   // Lift to S³ via inverse stereographic projection

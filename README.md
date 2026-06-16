@@ -211,11 +211,4 @@ make distclean
 
 The conjecture (Conjecture 4.4) states that for $\alpha p = 2$, if the knot is embedded in $S^3$, then every knot type admits an $E^{\alpha,p}_{S^3}$ energy minimizer.
 
-## Results
-Running the repository produces the following approximate minimum energies:
 
-| Knot Type             | E(min) | N(number of discrete points) |
-|---|---|---|
-| P=2 Q=3 (Trefoil Knot)| $\sim$ 53.1 | 5000 |
-| P=2 Q=5               | $\sim$ 106.5| 1000 |
-| P=2 Q=7               | $\sim$ 158.5| 1000 |

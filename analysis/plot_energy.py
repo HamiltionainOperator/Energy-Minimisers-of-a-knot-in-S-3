@@ -76,7 +76,7 @@ def plot(cols: Dict[str, np.ndarray], out_path: str, title: str) -> None:
     # ── Energy panel ────────────────────────────────────────────────────────
     ax0 = fig.add_subplot(gs[0])
     ax0.semilogy(iters, energy, color="#2563EB", linewidth=1.6,
-                 label="Tangent-point energy")
+                 label=r"O'Hara energy $E^{(2)}_{S^3}$")
     ax0.set_xlabel("Iteration")
     ax0.set_ylabel("Energy  (log scale)")
     ax0.set_title(title)

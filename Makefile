@@ -34,6 +34,7 @@ STEP    ?= 0.01
 TYPE    ?=
 CONNECT ?=           # connect-sum of torus knots, e.g. CONNECT="2,3 2,5"
 FRAMES  ?=           # if set (e.g. FRAMES=10) dump a live-viewer frame every K iters
+REPARAM ?=           # curvature-adaptive reparam interval (default 50; REPARAM=0 disables)
 # Strip any stray whitespace so values pass cleanly to the binary/scripts.
 P      := $(strip $(P))
 Q      := $(strip $(Q))
@@ -43,6 +44,7 @@ STEP    := $(strip $(STEP))
 TYPE    := $(strip $(TYPE))
 CONNECT := $(strip $(CONNECT))
 FRAMES  := $(strip $(FRAMES))
+REPARAM := $(strip $(REPARAM))
 
 # ─── Paths ─────────────────────────────────────────────────────────────────
 ROOT        := $(shell pwd)
@@ -65,13 +67,21 @@ ifneq ($(CONNECT),)
   PREFIX    := cs_$(subst $(space),_,$(subst $(comma),x,$(CONNECT)))
   KNOT      := connect-sum $(CONNECT)
   EXPECT    ?=                         # = product of component dets; verify with `make check`
+  CHECK_TYPE :=                        # not in verify_knot.py's table → invariants only
 else ifneq ($(TYPE),)
   PREFIX    := $(TYPE)
   KNOT      := $(TYPE)
   EXPECT    ?= 9                       # granny / square / granny_left = trefoil # trefoil
+  CHECK_TYPE :=                        # composite: not in the table → invariants only
 else
   PREFIX    := T$(P)_$(Q)
   KNOT      := T($(P),$(Q))
+  # verify_knot.py --expected key, e.g. T(2,7)
+  CHECK_TYPE := T($(P),$(Q))
+  # Torus knots are generated ON the Clifford torus; skip the ℝ³ RMS normalisation
+  # so they START there (the lift inverts the projection exactly) instead of in a
+  # distorted, off-centre configuration.
+  NORM_FLAG := --no-normalize
   ifeq ($(P),2)
     EXPECT  ?= $(Q)                    # determinant of T(2,q) is q
   else
@@ -130,7 +140,7 @@ endif
 # ─── S³ O'Hara energy minimisation ──────────────────────────────────────────
 energy: $(BINARY)
 	@echo "[2/4] Minimising E^(2)_{S³} for $(KNOT)  (ITER=$(ITER), α₀=$(STEP))…"
-	$(BINARY) $(VECT_INIT) $(ENERGY_LOG) $(VECT_S3) $(ITER) $(STEP) $(if $(FRAMES),--frames $(FRAMES),)
+	$(BINARY) $(VECT_INIT) $(ENERGY_LOG) $(VECT_S3) $(ITER) $(STEP) $(if $(FRAMES),--frames $(FRAMES),) $(if $(REPARAM),--reparam $(REPARAM),) $(NORM_FLAG)
 
 # ─── Plots & renders ────────────────────────────────────────────────────────
 plot:
@@ -144,10 +154,18 @@ render:
 	$(PYTHON) analysis/plot_vect.py $(VECT_S3) $(RENDER)
 	@echo "  → $(RENDER)"
 
-# ─── Topology check (robust determinant, majority vote over rotations) ──────
+# ─── Topology check (full invariants via SnapPy under SageMath) ─────────────
+# Runs analysis/verify_knot.py through Sage's Python, which has SnapPy: it builds
+# a planar-diagram code from the optimised S³ knot and reports the Alexander /
+# Jones polynomials, signature, determinant and SnapPy identification — a much
+# richer fingerprint than the bare determinant.  For torus knots T(p,q) the
+# expected type is passed so the run also prints an explicit PASS/FAIL.
+#   make check P=2 Q=7      → sage -python analysis/verify_knot.py …/T2_7_s3.vect --expected "T(2,7)"
+# Override the Sage binary with `make check SAGE=/path/to/sage`.
+SAGE ?= sage
 check:
-	@echo "[check] Robust determinant of $(VECT_S3)  (expected $(if $(EXPECT),$(EXPECT),?))…"
-	$(PYTHON) analysis/knot_check.py $(VECT_S3) $(if $(EXPECT),--expected $(EXPECT),)
+	@echo "[check] Verifying knot type of $(VECT_S3) via SnapPy$(if $(CHECK_TYPE), (expected $(CHECK_TYPE)),)…"
+	$(SAGE) -python analysis/verify_knot.py $(VECT_S3) $(if $(CHECK_TYPE),--expected "$(CHECK_TYPE)",)
 
 verify: check
 
@@ -156,6 +174,11 @@ verify: check
 #   make P=2 Q=3 ITER=3000 FRAMES=10      # terminal 1
 #   make live P=2 Q=3                     # terminal 2  (opens localhost:8000)
 live:
+	@test -f $(OUT_DIR)/trajectory.jsonl || { \
+	  echo "  ⚠ No trajectory at $(OUT_DIR)/trajectory.jsonl — the flow wasn't run with FRAMES."; \
+	  echo "    Produce one first (frames are written only when FRAMES is set):"; \
+	  echo "      make $(if $(CONNECT),CONNECT=\"$(CONNECT)\",$(if $(TYPE),TYPE=$(TYPE),P=$(P) Q=$(Q))) N=$(N) ITER=$(ITER) FRAMES=10"; \
+	  echo "    Opening the viewer anyway; it will display frames as soon as they appear."; }
 	$(PYTHON) analysis/live_view.py $(OUT_DIR)/trajectory.jsonl
 
 # ─── Cleaning ───────────────────────────────────────────────────────────────
@@ -180,5 +203,6 @@ help:
 	@echo ""
 	@echo "Targets:  run(default) build generate energy plot render check live clean distclean"
 	@echo ""
-	@echo "Params:   P Q N ITER STEP TYPE CONNECT FRAMES EXPECT"
+	@echo "Params:   P Q N ITER STEP TYPE CONNECT FRAMES REPARAM EXPECT"
 	@echo "  N, ITER, STEP changes ALWAYS re-run (no stale-file skipping)."
+	@echo "  REPARAM=0 disables curvature-adaptive reparam (diagnosing summand collapse)."

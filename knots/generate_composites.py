@@ -25,47 +25,110 @@ def torus_knot_r3(p, q, n):
     return P
 
 
-def _interp(a, b, k):
-    """k points strictly between a and b (endpoints excluded)."""
-    return [(a + (b - a) * (j / (k + 1.0))).tolist() for j in range(1, k + 1)]
+def _hermite(p0, m0, p1, m1, k):
+    """k interior points of the cubic Hermite spline p0→p1 with end tangents m0,m1.
+
+    Tangent-matched so the curve leaves p0 and enters p1 smoothly (G¹) — no sharp
+    corner where a bridge meets a knot, which is what blew the gradient up before.
+    """
+    pts = []
+    for j in range(1, k + 1):
+        t = j / (k + 1.0)
+        h00 = 2*t**3 - 3*t**2 + 1
+        h10 = t**3 - 2*t**2 + t
+        h01 = -2*t**3 + 3*t**2
+        h11 = t**3 - t**2
+        pts.append((h00*p0 + h10*m0 + h01*p1 + h11*m1).tolist())
+    return pts
+
+
+def _seg_polyline_dist(p, q):
+    """Crude min distance between two point-lists (used to detect a crossing)."""
+    P, Q = np.asarray(p), np.asarray(q)
+    return float(np.min(np.linalg.norm(P[:, None, :] - Q[None, :, :], axis=2)))
+
+
+def resample_uniform(loop, N):
+    """Resample a closed polygon to N points equally spaced in arc length.
+
+    Critical: a uniform edge length means knot segments and bridge segments are
+    the same size, so the discrete energy has no near-zero edge / huge-curvature
+    spikes — that mismatch is what produced the ~10⁶ initial gradient.
+    """
+    loop = np.asarray(loop, dtype=float)
+    closed = np.vstack([loop, loop[:1]])
+    seg = np.linalg.norm(np.diff(closed, axis=0), axis=1)
+    cum = np.concatenate([[0.0], np.cumsum(seg)])
+    total = cum[-1]
+    targets = np.linspace(0.0, total, N, endpoint=False)
+    idx = np.searchsorted(cum, targets, side="right") - 1
+    idx = np.clip(idx, 0, len(loop) - 1)
+    out = np.empty((N, 3))
+    for k, (s, j) in enumerate(zip(targets, idx)):
+        f = (s - cum[j]) / (seg[j] if seg[j] > 1e-12 else 1.0)
+        out[k] = loop[j] + (loop[(j + 1) % len(loop)] - loop[j]) * f
+    return out
+
+
+def _open_arc(K, toward, gw):
+    """Open knot K by REMOVING a short arc (2·gw+1 vertices) at the vertex facing
+    `toward`. Returns the remaining open polyline; arc[0] and arc[-1] are the two
+    cut ends, offset by the removed arc — the natural width of the connect band.
+    """
+    N = len(K)
+    p = int(np.argmin(np.linalg.norm(K - toward, axis=1)))
+    keep = [(p + gw + 1 + j) % N for j in range(N - (2 * gw + 1))]
+    return K[keep]
 
 
 def connect_sum(specs, n_total):
-    """specs = [(p1,q1), (p2,q2), …]  →  (N,3) closed connect-sum polygon."""
+    """specs = [(p1,q1), (p2,q2), …]  →  (N,3) closed connect-sum polygon.
+
+    Textbook construction: each summand is OPENED by removing a short arc on the
+    side facing its neighbour; the consecutive cut ends are joined by short,
+    tangent-matched bridges that form a flat, untwisted band (no bow). For each
+    join we pick the neighbour's traversal orientation that keeps the two band
+    strands from crossing. Finally the loop is resampled to uniform arc length.
+    """
     M = len(specs)
-    sep = 4.0
-    n_each = max(40, int(n_total * 0.82) // M)
+    sep = 2.4
+    n_each = max(80, int(n_total * 0.85) // M)
+    gw = max(1, n_each // 50)                       # half-width of removed arc
     knots = []
     for i, (p, q) in enumerate(specs):
-        K = torus_knot_r3(p, q, n_each) * 1.4
+        K = torus_knot_r3(p, q, n_each)
         K[:, 0] += i * sep
         knots.append(K)
+    centers = [K.mean(0) for K in knots]
 
-    zmin = min(K[:, 2].min() for K in knots)
-    zfloor, zret = zmin - 1.2, zmin - 2.6        # forward / return bridge planes
+    arcs = [_open_arc(knots[i], centers[(i + 1) % M], gw) for i in range(M)]
 
-    # Open each knot at its lowest vertex: arc[0] = entry, arc[-1] = exit.
-    arcs = []
-    for K in knots:
-        N = len(K)
-        bi = int(np.argmin(K[:, 2]))
-        arcs.append(K[[(bi + 1 + j) % N for j in range(N)]])
-
-    nb = max(6, int(n_total * 0.18) // M)
+    nb = max(8, int(n_total * 0.12) // M)
     loop = []
     for i in range(M):
         arc = arcs[i]
-        loop.extend(arc.tolist())                # traverse the whole knot
-        u = arc[-1]                              # exit of knot i
-        w = arcs[(i + 1) % M][0]                  # entry of next knot
-        z = zret if i == M - 1 else zfloor        # return bridge dips deeper
-        a, b = u.copy(), w.copy()
-        a[2] = z
-        b[2] = z
-        loop += _interp(u, a, 2) + [a.tolist()]
-        loop += _interp(a, b, nb if i < M - 1 else 2 * nb) + [b.tolist()]
-        loop += _interp(b, w, 2)                  # next arc starts exactly at w
-    return np.array(loop)
+        nxt = arcs[(i + 1) % M]
+        # Bridge from this arc's end (u) to the next arc's start (w). Try the
+        # next arc both ways and keep the orientation whose bridge stays farther
+        # from the *other* end of the band (no crossing → flat, untwisted band).
+        u, u_prev = arc[-1], arc[-2]
+        cand = []
+        for rev in (False, True):
+            a2 = nxt[::-1] if rev else nxt
+            w, w_next = a2[0], a2[1]
+            t_u = (u - u_prev); t_u /= (np.linalg.norm(t_u) + 1e-9)
+            t_w = (w_next - w); t_w /= (np.linalg.norm(t_w) + 1e-9)
+            L = np.linalg.norm(w - u) + 1e-9
+            br = _hermite(u, t_u * L, w, t_w * L, nb)
+            # separation from the band's other strand (this arc's start side)
+            sep_score = _seg_polyline_dist(br, [arc[0].tolist(), nxt[-1].tolist()])
+            cand.append((sep_score, rev, br, a2))
+        cand.sort(reverse=True)                     # most-separated orientation wins
+        _, _, br, a2 = cand[0]
+        arcs[(i + 1) % M] = a2                       # commit chosen orientation
+        loop.extend(arc.tolist())
+        loop.extend(br)
+    return resample_uniform(np.array(loop), n_total)
 
 
 def parse_spec(s):

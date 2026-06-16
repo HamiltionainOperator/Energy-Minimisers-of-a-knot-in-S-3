@@ -112,7 +112,9 @@ def main():
     print(f"Live viewer  →  {url}")
     print(f"Streaming    →  {traj}")
     if not os.path.exists(traj):
-        print("(file not there yet — it will appear once the optimizer starts)")
+        print("(no trajectory file yet — frames are written only when the flow is")
+        print(" run with FRAMES set, e.g.  make P=2 Q=3 ITER=3000 FRAMES=10 .")
+        print(" The viewer will display frames as soon as that file appears.)")
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(traj))
     if not args.no_open:
         webbrowser.open(url)

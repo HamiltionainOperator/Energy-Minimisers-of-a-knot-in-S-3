@@ -14,6 +14,11 @@
   #title { position:absolute; top:14px; left:18px; font-size:15px; letter-spacing:.3px;
            color:var(--muted); pointer-events:none; }
   #title b { color:var(--fg); }
+  #status { position:absolute; top:38px; left:18px; font-size:13px; color:var(--muted);
+            pointer-events:none; }
+  #status.warn { color:#f3b14b; }
+  #status.ok   { color:#48e08a; }
+  #status.err  { color:#f06a6a; }
   #side { width:340px; background:var(--panel); padding:18px; display:flex; flex-direction:column;
           gap:16px; border-left:1px solid #232838; }
   .stat { display:flex; justify-content:space-between; align-items:baseline; }
@@ -41,7 +46,10 @@
 </head>
 <body>
 <div id="app">
-  <div id="scene"><div id="title"><b>S³ O'Hara energy</b> &nbsp;—&nbsp; live knot evolution</div></div>
+  <div id="scene">
+    <div id="title"><b>S³ O'Hara energy</b> &nbsp;—&nbsp; live knot evolution</div>
+    <div id="status">connecting…</div>
+  </div>
   <div id="side">
     <div class="stat"><span class="k">iteration</span><span class="v" id="s-iter">—</span></div>
     <div class="stat"><span class="k">energy E²<sub>S³</sub></span><span class="v" id="s-energy">—</span></div>
@@ -147,8 +155,12 @@ function show(k){
   sIter.textContent=f.i; sEnergy.textContent=f.e.toFixed(3);
   scrub.value=k; drawChart();
 }
+const statusEl=document.getElementById('status');
+function setStatus(text, cls){ statusEl.textContent=text; statusEl.className=cls||''; }
+let waitTimer=null;
 function addFrame(f){
   frames.push(f); scrub.max=frames.length-1;
+  setStatus(`● streaming — ${frames.length} frame${frames.length>1?'s':''} (iter ${f.i})`, 'ok');
   if (follow) show(frames.length-1); else drawChart();
 }
 
@@ -174,7 +186,15 @@ requestAnimationFrame(loop);
 
 // ── live stream via SSE ─────────────────────────────────────────────────────
 const es = new EventSource('/stream');
+es.onopen = ()=>{
+  // Connected, but no frames yet → tell the user how to produce them, rather
+  // than leaving an empty scene that looks broken.
+  waitTimer = setTimeout(()=>{ if(!frames.length)
+    setStatus('● connected — waiting for frames (run the flow with FRAMES set, e.g. make … FRAMES=10)', 'warn');
+  }, 1200);
+};
 es.onmessage = (ev)=>{ try{ addFrame(JSON.parse(ev.data)); }catch(e){} };
+es.onerror = ()=>{ if(!frames.length) setStatus('⚠ cannot reach the stream — is live_view.py running?', 'err'); };
 es.addEventListener('done', ()=>{ liveDot.classList.remove('on'); });
 addEventListener('resize', drawChart);
 </script>

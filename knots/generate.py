@@ -28,9 +28,9 @@ import numpy as np
 # Geometry
 # ---------------------------------------------------------------------------
 
-def torus_knot_s3(p: int, q: int, n_points: int = 200) -> np.ndarray:
-    """Return (n_points, 4) unit points on S³ parametrising T(p,q)."""
-    t = np.linspace(0.0, 2.0 * math.pi, n_points, endpoint=False)
+def _torus_knot_s3_uniform_t(p: int, q: int, m: int) -> np.ndarray:
+    """(m, 4) unit points on S³ for T(p,q), sampled uniformly in the parameter t."""
+    t = np.linspace(0.0, 2.0 * math.pi, m, endpoint=False)
     inv_sqrt2 = 1.0 / math.sqrt(2.0)
     return np.column_stack([
         inv_sqrt2 * np.cos(p * t),
@@ -38,6 +38,47 @@ def torus_knot_s3(p: int, q: int, n_points: int = 200) -> np.ndarray:
         inv_sqrt2 * np.cos(q * t),
         inv_sqrt2 * np.sin(q * t),
     ])
+
+
+def torus_knot_s3(p: int, q: int, n_points: int = 200,
+                  oversample: int = 64) -> np.ndarray:
+    """Return (n_points, 4) unit points on S³ parametrising T(p,q), spaced at
+    EQUAL geodesic arc length on S³.
+
+    Sampling uniformly in the parameter t clusters vertices wherever the curve
+    moves slowly (the q-direction wobble of T(2,q) is a strong example), and the
+    stereographic image distorts this further — so a uniform-t initialisation
+    looks lopsided, with one lobe point-starved and another over-dense. That
+    asymmetry then biases the early energy flow and the diagnostics. We instead
+    oversample densely in t, measure the cumulative geodesic length on S³, and
+    re-pick n_points at equal arc length (slerping along each dense geodesic
+    edge). This is exactly the parametrisation reparametrize_s3() maintains in
+    the C++ optimiser, so the knot now STARTS uniform rather than being dragged
+    there over the first ~50 iterations.
+    """
+    m = max(n_points * oversample, n_points)
+    dense = _torus_knot_s3_uniform_t(p, q, m)              # (m,4) on S³
+
+    # Geodesic length of each closed edge:  θ_k = arccos⟨x_k, x_{k+1}⟩.
+    cdot = np.clip(np.einsum("ij,ij->i", dense, np.roll(dense, -1, axis=0)),
+                   -1.0, 1.0)
+    seg = np.arccos(cdot)
+    cum = np.concatenate([[0.0], np.cumsum(seg)])           # (m+1,)
+    total = cum[-1]
+
+    targets = np.linspace(0.0, total, n_points, endpoint=False)
+    j = np.clip(np.searchsorted(cum, targets, side="right") - 1, 0, m - 1)
+    th = seg[j]
+    f = np.where(th > 1e-12, (targets - cum[j]) / np.where(th > 1e-12, th, 1.0), 0.0)
+
+    a = dense[j]
+    b = dense[(j + 1) % m]
+    sn = np.sin(th)
+    w0 = np.where(th > 1e-12, np.sin((1.0 - f) * th) / np.where(sn > 1e-12, sn, 1.0), 1.0)
+    w1 = np.where(th > 1e-12, np.sin(f * th) / np.where(sn > 1e-12, sn, 1.0), 0.0)
+    out = w0[:, None] * a + w1[:, None] * b                 # slerp on each edge
+    out /= np.linalg.norm(out, axis=1, keepdims=True)
+    return out
 
 
 def s3_to_r3(pts: np.ndarray) -> np.ndarray:
