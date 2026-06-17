@@ -207,6 +207,25 @@ To remove the output files **and** the compiled CMake `build/` directory:
 ```bash
 make distclean
 ```
+
+---
+
+## 🙏 Credits & Acknowledgments
+
+This pipeline stands on several excellent open-source projects. Full credit to their authors:
+
+* **[Repulsor](https://github.com/HenrikSchumacher/Repulsor)** — Henrik Schumacher. A header-only C++ library for the generalized tangent-point energy of curves and surfaces. We use its `TangentPointMetric0::Solve` to assemble and apply the **$H^{1/2}$ Sobolev preconditioner** that makes the gradient flow resolution-independent. (Bundled in `Repulsor/`, along with its **Tensors** submodule, also by Henrik Schumacher.) — *MIT License, © 2022 Henrik Schumacher.*
+* **[Repulsive Curves](https://github.com/icethrush/repulsive-curves)** — Christopher Yu, Henrik Schumacher, and Keenan Crane, *"Repulsive Curves,"* ACM Transactions on Graphics (2021). The reference implementation and the tangent-point / Sobolev-descent ideas that inspired this project's optimizer design. (Bundled in `repulsive-curves/`.) — *MIT License, © 2019 Christopher Yu.*
+* **[SnapPy](https://snappy.computop.org/)** — Marc Culler, Nathan M. Dunfield, Matthias Goerner, and Jeffrey R. Weeks. Computes the Alexander/Jones polynomials, signature, determinant, and knot identification used by `make check` (`analysis/verify_knot.py`).
+* **[SageMath](https://www.sagemath.org/)** — The SageMath Developers. Hosts the Python environment (with SnapPy) that `make check` runs `verify_knot.py` under.
+* **[pyknotid](https://github.com/SPOCKnots/pyknotid)** — Alexander J. Taylor et al. Used by the legacy robust-determinant checker (`analysis/knot_check.py`).
+* **[three.js](https://threejs.org/)** — The live 3D web viewer (`analysis/live_view.html`) renders the deforming knot with three.js + `OrbitControls`. — *MIT License.*
+* **[NumPy](https://numpy.org/)** & **[Matplotlib](https://matplotlib.org/)** — Knot generation, geometry resampling, and all plots/renders.
+
+The mathematical target — the $S^3$ O'Hara energy $E^{(2)}_{S^3}$ and **Conjecture 4.4** (existence of an $E^{\alpha,p}_{S^3}$-minimizer for every knot type at $\alpha p = 2$) — is taken from the source paper that motivates this project.
+
+---
+
 # oharas-conjecture-s3
 
 The conjecture (Conjecture 4.4) states that for $\alpha p = 2$, if the knot is embedded in $S^3$, then every knot type admits an $E^{\alpha,p}_{S^3}$ energy minimizer.
