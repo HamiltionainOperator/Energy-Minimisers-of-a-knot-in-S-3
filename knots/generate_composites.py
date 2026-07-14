@@ -160,6 +160,16 @@ def generate_granny_left(N=5000):
     pts[:, 2] = -pts[:, 2]
     return pts
 
+def generate_figure8(N=1000):
+    # Figure-eight knot 4_1 (the simplest non-torus, non-composite knot; amphichiral,
+    # hyperbolic, determinant 5, genus 1). Standard parametrisation, then resampled
+    # to uniform arc length for an even starting distribution.
+    t = np.linspace(0, 2 * np.pi, N * 8, endpoint=False)
+    x = (2 + np.cos(2*t)) * np.cos(3*t)
+    y = (2 + np.cos(2*t)) * np.sin(3*t)
+    z = np.sin(4*t)
+    return resample_uniform(np.column_stack([x, y, z]), N)
+
 def write_vect(filename, pts):
     with open(filename, 'w') as f:
         f.write("1\n")
@@ -174,8 +184,8 @@ if __name__ == '__main__':
     parser.add_argument('--n', type=int, default=1000,
                         help='approximate total number of points')
     parser.add_argument('--type', type=str,
-                        choices=['granny', 'square', 'granny_left'],
-                        help='named composite preset')
+                        choices=['granny', 'square', 'granny_left', 'figure8'],
+                        help='named preset (composites or the figure-eight knot)')
     parser.add_argument('--connect', nargs='+', type=parse_spec, metavar='p,q',
                         help='connect-sum of torus knots, e.g. --connect 2,3 2,5')
     parser.add_argument('--out', type=str, required=True)
@@ -198,6 +208,9 @@ if __name__ == '__main__':
     elif args.type == 'granny_left':
         pts = generate_granny_left(args.n)
         label = 'granny_left'
+    elif args.type == 'figure8':
+        pts = generate_figure8(args.n)
+        label = 'figure8'
 
     write_vect(args.out, pts)
     print(f"Generated {label}  (N={len(pts)})  →  {args.out}")

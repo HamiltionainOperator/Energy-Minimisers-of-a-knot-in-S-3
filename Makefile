@@ -12,10 +12,11 @@
 #   make P=2 Q=3 N=1000 ITER=2000              # trefoil  T(2,3)
 #   make P=3 Q=5 N=1000 ITER=4000 STEP=0.005   # T(3,5)
 #
-# Composite knots (set TYPE; P/Q are ignored):
+# Named presets (set TYPE; P/Q are ignored):
 #   make TYPE=granny      N=1000 ITER=6000
 #   make TYPE=square      N=1000 ITER=6000
 #   make TYPE=granny_left N=1000 ITER=6000
+#   make TYPE=figure8     N=1000 ITER=4000    # figure-eight 4_1 (det 5)
 #
 # Single steps:  make build | generate | energy | plot | render | check
 # ═══════════════════════════════════════════════════════════════════════════
@@ -35,6 +36,7 @@ TYPE    ?=
 CONNECT ?=           # connect-sum of torus knots, e.g. CONNECT="2,3 2,5"
 FRAMES  ?=           # if set (e.g. FRAMES=10) dump a live-viewer frame every K iters
 REPARAM ?=           # curvature-adaptive reparam interval (default 50; REPARAM=0 disables)
+ENERGY  ?= density   # density (E^(2)_{S³}) | quantity (E_q = L⁻²·E_{S³}, anti-pull-tight)
 # Strip any stray whitespace so values pass cleanly to the binary/scripts.
 P      := $(strip $(P))
 Q      := $(strip $(Q))
@@ -45,6 +47,7 @@ TYPE    := $(strip $(TYPE))
 CONNECT := $(strip $(CONNECT))
 FRAMES  := $(strip $(FRAMES))
 REPARAM := $(strip $(REPARAM))
+ENERGY  := $(strip $(ENERGY))
 
 # ─── Paths ─────────────────────────────────────────────────────────────────
 ROOT        := $(shell pwd)
@@ -71,8 +74,12 @@ ifneq ($(CONNECT),)
 else ifneq ($(TYPE),)
   PREFIX    := $(TYPE)
   KNOT      := $(TYPE)
-  EXPECT    ?= 9                       # granny / square / granny_left = trefoil # trefoil
-  CHECK_TYPE :=                        # composite: not in the table → invariants only
+  ifeq ($(TYPE),figure8)
+    EXPECT  ?= 5                       # figure-eight 4_1 has determinant 5
+  else
+    EXPECT  ?= 9                       # granny / square / granny_left = trefoil # trefoil
+  endif
+  CHECK_TYPE :=                        # composite / figure8: not in the table → invariants only
 else
   PREFIX    := T$(P)_$(Q)
   KNOT      := T($(P),$(Q))
@@ -89,7 +96,10 @@ else
   endif
 endif
 
-OUT_DIR     := $(ROOT)/output/$(PREFIX)
+# Quantity-energy runs (ENERGY=quantity) write to a parallel _q/ tree so they
+# coexist with the density results for the same knot.
+ESUF        := $(if $(filter quantity,$(ENERGY)),_q,)
+OUT_DIR     := $(ROOT)/output/$(PREFIX)$(ESUF)
 VECT_INIT   := $(OUT_DIR)/$(PREFIX).vect
 VECT_S3     := $(OUT_DIR)/$(PREFIX)_s3.vect
 ENERGY_LOG  := $(OUT_DIR)/energy_log.csv
@@ -139,14 +149,14 @@ endif
 
 # ─── S³ O'Hara energy minimisation ──────────────────────────────────────────
 energy: $(BINARY)
-	@echo "[2/4] Minimising E^(2)_{S³} for $(KNOT)  (ITER=$(ITER), α₀=$(STEP))…"
-	$(BINARY) $(VECT_INIT) $(ENERGY_LOG) $(VECT_S3) $(ITER) $(STEP) $(if $(FRAMES),--frames $(FRAMES),) $(if $(REPARAM),--reparam $(REPARAM),) $(NORM_FLAG)
+	@echo "[2/4] Minimising $(if $(filter quantity,$(ENERGY)),E_q = L⁻²·E_{S³},E^(2)_{S³}) for $(KNOT)  (ITER=$(ITER), α₀=$(STEP))…"
+	$(BINARY) $(VECT_INIT) $(ENERGY_LOG) $(VECT_S3) $(ITER) $(STEP) $(if $(filter quantity,$(ENERGY)),--energy quantity,) $(if $(FRAMES),--frames $(FRAMES),) $(if $(REPARAM),--reparam $(REPARAM),) $(NORM_FLAG)
 
 # ─── Plots & renders ────────────────────────────────────────────────────────
 plot:
 	@echo "[3/4] Plotting energy curve…"
 	$(PYTHON) analysis/plot_energy.py $(ENERGY_LOG) \
-	    --out $(ENERGY_PNG) --title "$(KNOT)  E^(2) on S^3"
+	    --out $(ENERGY_PNG) --title "$(KNOT)  $(if $(filter quantity,$(ENERGY)),E_q = L^-2 E on S^3,E^(2) on S^3)"
 	@echo "  → $(ENERGY_PNG)"
 
 render:
@@ -154,20 +164,27 @@ render:
 	$(PYTHON) analysis/plot_vect.py $(VECT_S3) $(RENDER)
 	@echo "  → $(RENDER)"
 
-# ─── Topology check (full invariants via SnapPy under SageMath) ─────────────
-# Runs analysis/verify_knot.py through Sage's Python, which has SnapPy: it builds
-# a planar-diagram code from the optimised S³ knot and reports the Alexander /
-# Jones polynomials, signature, determinant and SnapPy identification — a much
-# richer fingerprint than the bare determinant.  For torus knots T(p,q) the
-# expected type is passed so the run also prints an explicit PASS/FAIL.
-#   make check P=2 Q=7      → sage -python analysis/verify_knot.py …/T2_7_s3.vect --expected "T(2,7)"
-# Override the Sage binary with `make check SAGE=/path/to/sage`.
-SAGE ?= sage
+# ─── Topology check (robust determinant, majority vote over rotations) ──────
+# Runs analysis/knot_check.py (pyknotid): computes the knot determinant
+# |Δ_K(−1)| under many random 3-D rotations and takes the majority vote, so a
+# single degenerate projection can't mislabel the knot.  EXPECT is auto-set for
+# T(2,q), the named composites, and figure8; pass EXPECT=… for anything else
+# (a connect sum's determinant is the PRODUCT of its components').
+#   make check P=2 Q=7                  → expects det 7
+#   make check CONNECT="2,3 2,5" EXPECT=15
 check:
-	@echo "[check] Verifying knot type of $(VECT_S3) via SnapPy$(if $(CHECK_TYPE), (expected $(CHECK_TYPE)),)…"
-	$(SAGE) -python analysis/verify_knot.py $(VECT_S3) $(if $(CHECK_TYPE),--expected "$(CHECK_TYPE)",)
+	@echo "[check] Robust determinant of $(VECT_S3)$(if $(EXPECT), (expected $(EXPECT)),)…"
+	$(PYTHON) analysis/knot_check.py $(VECT_S3) $(if $(EXPECT),--expected $(EXPECT),)
 
-verify: check
+# ─── Full invariants via SnapPy under SageMath (needs a working `sage`) ──────
+# Richer fingerprint than the bare determinant: Alexander / Jones polynomials,
+# signature, determinant, and SnapPy identification.  The polynomial invariants
+# require SnapPy to run inside Sage; override the binary with SAGE=/path/to/sage.
+#   make verify P=2 Q=7     → sage -python analysis/verify_knot.py …/T2_7_s3.vect --expected "T(2,7)"
+SAGE ?= sage
+verify:
+	@echo "[verify] Full SnapPy invariants of $(VECT_S3)$(if $(CHECK_TYPE), (expected $(CHECK_TYPE)),)…"
+	$(SAGE) -python analysis/verify_knot.py $(VECT_S3) $(if $(CHECK_TYPE),--expected "$(CHECK_TYPE)",)
 
 # ─── Live web viewer (rotate/zoom 3-D knot + energy curve, streamed live) ────
 # Run the optimizer with FRAMES set, then `make live` in another terminal:
@@ -193,16 +210,23 @@ help:
 	@echo "S³ O'Hara Energy Knot Pipeline"
 	@echo ""
 	@echo "Torus knots:      make P=2 Q=3 N=1000 ITER=2000"
-	@echo "Named composites: make TYPE=granny N=1000 ITER=6000"
-	@echo "                  (TYPE = granny | square | granny_left)"
+	@echo "Named presets:    make TYPE=granny N=1000 ITER=6000"
+	@echo "                  (TYPE = granny | square | granny_left | figure8)"
 	@echo "Connect sums:     make CONNECT=\"2,3 2,5\" N=1000 ITER=4000   # T(2,3) # T(2,5)"
 	@echo "                  make CONNECT=\"2,3 2,3 2,3\"                  # any number of torus knots"
+	@echo ""
+	@echo "Quantity energy:  make TYPE=granny ENERGY=quantity N=2000 ITER=8000   # E_q = L^-2 E_{S^3}"
+	@echo "                  (anti-pull-tight composite pipeline; writes to output/<knot>_q/)"
+	@echo "                  ./build/energy_s3 --cliffordtable 2000   # reproduce O'Hara Table 5.1"
 	@echo ""
 	@echo "Live 3-D viewer:  make P=2 Q=3 ITER=3000 FRAMES=10   # terminal 1"
 	@echo "                  make live P=2 Q=3                   # terminal 2"
 	@echo ""
-	@echo "Targets:  run(default) build generate energy plot render check live clean distclean"
+	@echo "Targets:  run(default) build generate energy plot render check verify live clean distclean"
+	@echo "  check  = robust determinant (pyknotid, majority vote — no Sage needed)"
+	@echo "  verify = full SnapPy invariants (needs a working \`sage\`)"
 	@echo ""
-	@echo "Params:   P Q N ITER STEP TYPE CONNECT FRAMES REPARAM EXPECT"
+	@echo "Params:   P Q N ITER STEP TYPE CONNECT FRAMES REPARAM ENERGY EXPECT"
+	@echo "  ENERGY=quantity uses E_q=L^-2 E_{S^3} (resists pull-tight; output/<knot>_q/)."
 	@echo "  N, ITER, STEP changes ALWAYS re-run (no stale-file skipping)."
 	@echo "  REPARAM=0 disables curvature-adaptive reparam (diagnosing summand collapse)."

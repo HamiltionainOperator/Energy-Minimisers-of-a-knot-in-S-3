@@ -13,8 +13,9 @@ The energy and its exact analytic $\mathbb{R}^4$ gradient are computed directly 
 * **Stereographic Lifting**: Generates $T(p,q)$ torus knots in $\mathbb{R}^3$ and lifts them to $S^3$.
 * **Sobolev Preconditioning**: Uses an $H^{1/2}$ preconditioned metric for resolution-independent gradient descent.
 * **Exact analytic gradient**: Multithreaded $O(N^2)$ evaluation of $E^{(2)}_{S^3}$ and its exact gradient (FD-validated), with an $O(N^2)$ difference-array treatment of the arc-length term.
-* **Torus knots & connect sums**: Generates $T(p,q)$ torus knots and arbitrary connect sums $\(T(p_1,q_1)\sharp T(p_2,q_2)\sharp\cdots\sharp T(p_n,q_n)\)$ of them.
-* **Robust topological verification**: Computes the knot **determinant** by majority vote over random projections (`analysis/knot_check.py`), so a degenerate projection can't mislabel a knot as the unknot. A connect sum's determinant must equal the *product* of its components'.
+* **Two energies**: the density energy $E^{(2)}_{S^3}$ (default) and O'Hara's spherical **quantity** energy $E_q = L^{-2}\,E^{(2)}_{S^3}$ (`ENERGY=quantity`), whose pull-tight resistance makes composite knots minimizable; both reproduce the paper's Clifford-torus benchmarks ($E_d^{\min}\approx 54.33$ at $r\approx 0.861$, $E_q^{\min}\approx 0.2453$ at $r\approx 0.776$ — Table 5.1).
+* **Torus knots, presets & connect sums**: $T(p,q)$ torus knots, named presets (`granny`, `square`, `granny_left`, `figure8`), and arbitrary connect sums $T(p_1,q_1)\,\sharp\,T(p_2,q_2)\,\sharp\cdots\sharp\,T(p_n,q_n)$.
+* **Robust topological verification**: `make check` computes the knot **determinant** by majority vote over random projections (`analysis/knot_check.py`, pyknotid), so a degenerate projection can't mislabel a knot as the unknot. A connect sum's determinant must equal the *product* of its components'. `make verify` (optional, needs SageMath) adds the full SnapPy invariants.
 * **Live 3D viewer**: A browser viewer (three.js) that streams the knot deforming in real time as the optimizer runs — rotate, zoom, scrub the timeline.
 * **Automated Pipeline**: A single `make` command drives generation, energy minimization, plotting, and rendering.
 
@@ -56,7 +57,7 @@ The analysis and generation scripts require Python 3. Install the required packa
 ```bash
 pip install -r requirements.txt
 ```
-*(Required: `numpy`, `matplotlib`, `pyknotid`. `snappy` is optional — only the legacy `analysis/verify_knot.py` uses it; the default `make check` uses `pyknotid` via `analysis/knot_check.py`.)*
+*(Required: `numpy`, `matplotlib`, `pyknotid` — these cover the whole default pipeline including `make check`. Optional: `snappy` **inside SageMath** is needed only for `make verify` / `analysis/verify_knot.py` / `analysis/knot_invariants.py`, which report the full Alexander/Jones/signature invariants; SnapPy's polynomial invariants refuse to run outside Sage.)*
 
 ---
 
@@ -83,22 +84,29 @@ Generation → minimization → energy plot → 3D render, in one command:
 # Torus knots — every parameter always takes effect (no stale-file skipping)
 make P=2 Q=3 N=1000 ITER=2000
 
-# Named composite presets (P/Q ignored)
+# Named presets (P/Q ignored)
 make TYPE=granny      N=1000 ITER=6000
 make TYPE=square      N=1000 ITER=6000
+make TYPE=figure8     N=1000 ITER=4000           # figure-eight 4_1 (det 5)
 
 # Connect sums of ARBITRARY torus knots — T(p1,q1) # T(p2,q2) # …
 make CONNECT="2,3 2,5"       N=1000 ITER=4000    # trefoil # cinquefoil  (det 3·5 = 15)
 make CONNECT="2,3 2,3"       N=1000 ITER=6000    # granny  (det 9)
 make CONNECT="2,3 2,3 2,3"   N=1200 ITER=8000    # any number of summands
 
+# O'Hara's spherical QUANTITY energy E_q = L⁻²·E_{S³} — resists pull-tight, so
+# composite knots keep their summands. Writes to a parallel output/<knot>_q/ tree.
+make TYPE=granny ENERGY=quantity N=2000 ITER=8000
+make CONNECT="2,3 2,5" ENERGY=quantity N=1000 ITER=4000
+
 # Verify the knot type survived (robust determinant, majority vote over rotations).
-# A connect sum's determinant is the PRODUCT of its components' determinants.
+# EXPECT is auto-set for T(2,q), the presets and figure8; a connect sum's
+# determinant is the PRODUCT of its components' — pass it explicitly.
 make check P=2 Q=3
-make check CONNECT="2,3 2,5"
+make check CONNECT="2,3 2,5" EXPECT=15
 ```
 
-Outputs land in `output/<knot>/`: `energy_log.png` (convergence curve), `<knot>_render.png` (3D render), `energy_log.csv` (raw data), `<knot>_s3.vect` (final knot).
+Outputs land in `output/<knot>/` (`output/<knot>_q/` for `ENERGY=quantity`): `energy_log.png` (convergence curve), `<knot>_render.png` (3D render), `energy_log.csv` (raw data, incl. total geodesic length per iteration), `<knot>_s3.vect` (final knot).
 
 ### 🎥 Live 3D Viewer
 Watch the knot deform in real time in your browser — rotate / zoom / pan, with the energy curve drawing live as the optimizer runs:
@@ -124,10 +132,12 @@ You can override the following variables on the command line:
 | `N` | `1000` | Number of discretised vertices |
 | `ITER` | `2000` | **Max** iterations (an upper bound — the flow stops early when converged) |
 | `STEP` | `0.01` | Initial step size ($\alpha_0$) for the Armijo line search |
-| `TYPE` | — | Named composite preset: `granny`, `square`, or `granny_left` |
+| `TYPE` | — | Named preset: `granny`, `square`, `granny_left`, or `figure8` |
 | `CONNECT` | — | Connect sum of torus knots, e.g. `CONNECT="2,3 2,5"` |
+| `ENERGY` | `density` | `density` = $E^{(2)}_{S^3}$; `quantity` = $E_q = L^{-2}E^{(2)}_{S^3}$ (anti-pull-tight; writes to `output/<knot>_q/`) |
+| `REPARAM` | `50` | Curvature-adaptive reparametrisation interval; `REPARAM=0` disables it |
 | `FRAMES` | — | If set (e.g. `FRAMES=10`), dump a live-viewer frame every $K$ iterations |
-| `EXPECT` | auto | Expected determinant for `make check` (auto for $T(2,q)$ and presets) |
+| `EXPECT` | auto | Expected determinant for `make check` (auto for $T(2,q)$, the presets and `figure8`) |
 
 Changing `N`, `ITER`, or `STEP` **always** re-runs (the pipeline no longer skips on stale output files).
 
@@ -144,12 +154,13 @@ make P=3 Q=5 N=1000 ITER=4000 STEP=0.005
 `make` (or `make run`) sequentially runs these targets; you can also run any individually (pass the same `P/Q`/`TYPE`/`CONNECT` to each so they resolve the same output directory):
 
 1. **`make build`**: Compiles `Repulsor/energy_s3.cpp` → `build/energy_s3` (auto-rebuilds on source change).
-2. **`make generate`**: Generates the initial knot — a $T(p,q)$ torus knot, a named composite (`TYPE=…`), or a connect sum (`CONNECT="…"`).
-3. **`make energy`**: Normalises and lifts the points to $S^3$, then minimises $E^{(2)}_{S^3}$ (analytic gradient → $H^{1/2}$ preconditioning → Armijo line search, with a tunnel-proof step guard).
-4. **`make plot`**: Generates the convergence plot `energy_log.png` of $E^{(2)}_{S^3}$ over the iterations.
+2. **`make generate`**: Generates the initial knot — a $T(p,q)$ torus knot, a named preset (`TYPE=…`), or a connect sum (`CONNECT="…"`).
+3. **`make energy`**: Normalises and lifts the points to $S^3$, then minimises $E^{(2)}_{S^3}$ (or $E_q$ with `ENERGY=quantity`): analytic gradient → $H^{1/2}$ preconditioning → Armijo line search, with a tunnel-proof step guard.
+4. **`make plot`**: Generates the convergence plot `energy_log.png` of the energy over the iterations.
 5. **`make render`**: Renders the final minimized knot to `<knot>_render.png`.
-6. **`make check`**: Verifies the knot type via the robust determinant (majority vote over rotations).
-7. **`make live`**: Opens the live 3D web viewer (requires a run with `FRAMES` set).
+6. **`make check`**: Verifies the knot type via the robust determinant (pyknotid, majority vote over rotations).
+7. **`make verify`** *(optional)*: Full SnapPy invariants — Alexander/Jones, signature, determinant, identification. Requires a working `sage` (override with `SAGE=/path/to/sage`).
+8. **`make live`**: Opens the live 3D web viewer (requires a run with `FRAMES` set).
 
 ---
 
@@ -183,16 +194,44 @@ We evaluate the knot's **Determinant**, $\det(K) = |\Delta_K(-1)|$ (where $\Delt
 Run the check via `make` (uses `analysis/knot_check.py` — a robust **majority vote over random rotations**, which avoids the degenerate-projection failure of a single fixed view):
 
 ```bash
-make check P=3 Q=5
-make check CONNECT="2,3 2,5"     # expects det 15
+make check P=2 Q=7                          # T(2,q): EXPECT auto-set to q
+make check TYPE=figure8                     # auto EXPECT=5
+make check CONNECT="2,3 2,5" EXPECT=15      # connect sum: det = product
 ```
 
 Or call the script directly on the final `<knot>_s3.vect`:
 ```bash
-python3 analysis/knot_check.py output/T3_5/T3_5_s3.vect --expected 5
+python3 analysis/knot_check.py output/T2_7/T2_7_s3.vect --expected 7
+```
+
+Note the determinant is a weak invariant for some torus knots — $T(3,4)$ has det 3 (same as a trefoil) and $T(3,5)$ has det 1 (same as the unknot!) — so for $T(3,q)$ results prefer `make verify`, which computes the full Alexander/Jones polynomials and signature via SnapPy (requires SageMath):
+
+```bash
+make verify P=3 Q=5              # sage -python analysis/verify_knot.py … --expected "T(3,5)"
 ```
 
 > ⚠️ **Caveat (open issue):** torus knots and the unknot minimize cleanly and preserve their type. Composite knots (granny / connect sums) can still **tunnel** during long minimizations because of the weak energy barrier — the *generator* produces a verified connect sum, but the *minimized* result must be re-checked before being trusted.
+
+---
+
+## 🔬 Diagnostics & Research Tools
+
+The `energy_s3` binary has several no-minimisation modes for validating the energies:
+
+```bash
+./build/energy_s3 knot.vect --gradcheck                    # analytic vs finite-difference ∇E^(2)_{S³}
+./build/energy_s3 knot.vect --gradcheck --energy quantity  # same for ∇E_q
+./build/energy_s3 --calibrate 400        # great-circle unknot: E_geo ≈ 0, E_chordal → 4
+./build/energy_s3 --cliffordtable 2000   # reproduce O'Hara Table 5.1 (E_d & E_q vs torus radius r)
+./build/energy_s3 --cliffordscan 3 5     # best on-Clifford E_d/E_q over r for T(p,q)
+./build/energy_s3 --eval a_s3.vect …     # re-evaluate converged curves under geodesic AND chordal energies
+```
+
+Optimiser extras (all off by default): `--reparam K` / `--reparam-curv w` (arc-length reparametrisation cadence and its curvature weight), `--len-cap f` (stop if total length exceeds $f\cdot L_0$, quantity-mode runaway guard), `--no-guard` (disable the tunnel-proof step guard, for experiments only), and an O'Hara-suggested bending-energy continuation `--bend c` (+ `--bendform theta2|tan2`, `--bend-decay r`, `--bend-min f`, `--bend-hold`) that minimises $F = E + C\int\kappa^2 ds$ over a decreasing schedule of $C$.
+
+`knots/generate.py` can also **diffuse a knot away from its symmetric start** with a topology-preserving single-vertex random walk (`--random-walk`, with `--seed/--walk-steps/--walk-amp/--walk-clearance`, then `--upsample-to M`) for convergence-basin experiments.
+
+Research harnesses in `analysis/` (each documents itself in its docstring): `eval_dual_energy.py` (geodesic vs chordal table over converged runs), `clifford_check.py` / `clifford_release.py` / `clifford_study.py` (does the minimiser lie on a Clifford torus?), `genus_scan_quantity.py` (min $E_q$ vs Seifert genus), `perturb_stability.py` (kick-and-reminimise local-minimum probe), `test_conjecture.py` (batch composite-knot runs).
 
 ---
 
@@ -216,9 +255,9 @@ This pipeline stands on several excellent open-source projects. Full credit to t
 
 * **[Repulsor](https://github.com/HenrikSchumacher/Repulsor)** — Henrik Schumacher. A header-only C++ library for the generalized tangent-point energy of curves and surfaces. We use its `TangentPointMetric0::Solve` to assemble and apply the **$H^{1/2}$ Sobolev preconditioner** that makes the gradient flow resolution-independent. (Bundled in `Repulsor/`, along with its **Tensors** submodule, also by Henrik Schumacher.) — *MIT License, © 2022 Henrik Schumacher.*
 * **[Repulsive Curves](https://github.com/icethrush/repulsive-curves)** — Christopher Yu, Henrik Schumacher, and Keenan Crane, *"Repulsive Curves,"* ACM Transactions on Graphics (2021). The reference implementation and the tangent-point / Sobolev-descent ideas that inspired this project's optimizer design. (Bundled in `repulsive-curves/`.) — *MIT License, © 2019 Christopher Yu.*
-* **[SnapPy](https://snappy.computop.org/)** — Marc Culler, Nathan M. Dunfield, Matthias Goerner, and Jeffrey R. Weeks. Computes the Alexander/Jones polynomials, signature, determinant, and knot identification used by `make check` (`analysis/verify_knot.py`).
-* **[SageMath](https://www.sagemath.org/)** — The SageMath Developers. Hosts the Python environment (with SnapPy) that `make check` runs `verify_knot.py` under.
-* **[pyknotid](https://github.com/SPOCKnots/pyknotid)** — Alexander J. Taylor et al. Used by the legacy robust-determinant checker (`analysis/knot_check.py`).
+* **[pyknotid](https://github.com/SPOCKnots/pyknotid)** — Alexander J. Taylor et al. Powers the default `make check`: the robust majority-vote determinant (`analysis/knot_check.py`).
+* **[SnapPy](https://snappy.computop.org/)** — Marc Culler, Nathan M. Dunfield, Matthias Goerner, and Jeffrey R. Weeks. Computes the Alexander/Jones polynomials, signature, determinant, and knot identification used by the optional `make verify` (`analysis/verify_knot.py`, `analysis/knot_invariants.py`).
+* **[SageMath](https://www.sagemath.org/)** — The SageMath Developers. Hosts the Python environment SnapPy's polynomial invariants require; only needed for `make verify`.
 * **[three.js](https://threejs.org/)** — The live 3D web viewer (`analysis/live_view.html`) renders the deforming knot with three.js + `OrbitControls`. — *MIT License.*
 * **[NumPy](https://numpy.org/)** & **[Matplotlib](https://matplotlib.org/)** — Knot generation, geometry resampling, and all plots/renders.
 

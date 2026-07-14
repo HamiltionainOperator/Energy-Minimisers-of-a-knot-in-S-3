@@ -63,6 +63,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <random>
 #include <sstream>
 #include <stdexcept>
@@ -93,12 +94,20 @@ static constexpr Real BH_THETA = 0.5; // Barnes-Hut opening angle
 
 static constexpr Real EPS = 1e-14;
 static bool CCD_ENABLED = false;  // toggled on via --ccd flag
+static bool GUARD_ENABLED = true; // --no-guard: disable the any_self_passage CCD
+                                  // tunnel guard, to test whether the bending
+                                  // energy ALONE preserves topology (O'Hara's idea)
 static int G_THREADS = 1;         // set in main from hardware_concurrency
 static int FRAME_EVERY = 0;       // --frames K: dump a trajectory frame every K
                                   // iterations for the live viewer (0 = off)
 static std::string TRAJ_PATH;     // where the trajectory JSONL is written
 static int REPARAM_EVERY = 50;    // --reparam K: re-uniformise arc length every K
                                   // iterations (0 = off; for collapse diagnosis)
+static Real REPARAM_CURV = 1.0;   // --reparam-curv w: curvature share of the
+                                  // reparam measure dμ=ds+λ·dκ. w=0 ⇒ pure UNIFORM
+                                  // arc length (needs the bending term to be safe
+                                  // against summand starvation); w>0 ⇒ curvature-
+                                  // adaptive (size-independent per-summand floor).
 static bool NORMALIZE = true;     // --no-normalize: skip the ℝ³ centre+RMS-scale
                                   // step before the S³ lift. That step is an ℝ³
                                   // similarity (NOT an S³ isometry), so it distorts
@@ -106,6 +115,35 @@ static bool NORMALIZE = true;     // --no-normalize: skip the ℝ³ centre+RMS-s
                                   // skipping it starts T(p,q) on the pristine
                                   // Clifford torus.  Composites (generated in ℝ³ at
                                   // large scale) still want it ON.
+
+// ─── Energy mode:  density E_d = E^(2)_{S³}  vs  quantity E_q = L⁻²·E_d ───────
+// O'Hara's spherical QUANTITY energy (Energy of knots in a 3-manifold, §5) holds
+// the TOTAL charge constant instead of the charge density: E_q(K)=L⁻²·E_d(K) with
+// L the total geodesic length.  Pull-tight shrinks L and so RAISES E_q ⇒ the
+// energy resists the composite-knot failure mode.  Default = Density so every
+// existing torus-knot run is byte-for-byte unchanged; --energy quantity opts in.
+enum class EnergyMode { Density, Quantity };
+static EnergyMode ENERGY_MODE = EnergyMode::Density;
+static Real LEN_RUNAWAY = 4.0;    // --len-cap f: soft-stop if L exceeds f·L₀
+                                  // (discretisation-driven length runaway guard;
+                                  // does NOT penalise L in the objective).
+
+// ─── O'Hara bending regularisation:  F = E + C·∫κ²ds  (continuation C→0⁺) ─────
+// A pull-tight makes the total squared curvature explode, so adding C·∫κ²ds to
+// the objective forbids self-passage ENERGETICALLY (no geometric guard needed),
+// then C→0 recovers the pure O'Hara minimiser.  Suggested by J. O'Hara.
+enum class BendForm { Theta2, Tan2Half };  // Φ(θ)=θ²  vs  Φ(θ)=4·tan²(θ/2)
+static BendForm BEND_FORM = BendForm::Theta2;
+static Real BENDING_C   = 0.0;    // current absolute coefficient C (set per level)
+static Real BEND_REL    = 0.0;    // --bend c: initial weight as fraction of energy
+                                  // (C_start = c·E0/bend0); 0 = off (pure O'Hara)
+static Real BEND_DECAY  = 0.5;    // --bend-decay r: C multiplied by r each level
+static Real C_MIN_FRAC  = 1e-3;   // --bend-min f: stop decaying below f·C_start, →0
+static bool BEND_HOLD   = false;  // --bend-hold: stop at the finite C floor, DON'T
+                                  // take the final C=0 level (the pure-O'Hara
+                                  // connect-sum pull-tightens at C=0; the finite-C
+                                  // F-minimiser is the non-tight object to report)
+static constexpr Real W_FLOOR = 1e-9;  // Voronoi-weight floor (degenerate edges)
 
 inline Real dot4(const Real *a, const Real *b) noexcept {
   return a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
@@ -127,6 +165,22 @@ inline void normalise4(Real *a) noexcept {
 inline Real geodesic_dist(const Real *x, const Real *y) noexcept {
   Real d = std::max(-1.0, std::min(1.0, dot4(x, y)));
   return std::acos(d);
+}
+
+// ─── Ambient distance selector ───────────────────────────────────────────────
+// The O'Hara integrand is  1/d_ambient(x,y)² − 1/d_K(x,y)² .  The ONLY thing
+// that differs between the geodesic S³ energy and the chordal-Euclidean Möbius
+// energy is the ambient term; the intrinsic arc-length distance d_K, the
+// arc-length weights, the diagonal cutoff and the quadrature are identical.
+// Both ambient distances are monotone functions of the geodesic angle θ:
+//   geodesic:  d_S³  = θ
+//   chordal :  |x−y|_{ℝ⁴} = 2 sin(θ/2)    (the Euclidean chord in ℝ⁴)
+// so the energy loop computes θ exactly once (it also drives the cutoff and the
+// geometry) and maps it through ambient_dist() — no parallel reimplementation.
+enum class AmbientMetric { Geodesic, Chordal };
+
+inline Real ambient_dist(Real theta, AmbientMetric m) noexcept {
+  return (m == AmbientMetric::Chordal) ? 2.0 * std::sin(0.5 * theta) : theta;
 }
 
 /**
@@ -199,7 +253,7 @@ void reparametrize_s3(std::vector<Real> &v4, int n) {
   // of vertices (with CURV_WEIGHT=1, ≈25% per summand of a two-summand knot).
   // For a uniform-curvature curve (torus knot) the turning is spread evenly, so
   // the measure is ∝ arc length and this reduces to the old behaviour.
-  constexpr Real CURV_WEIGHT = 1.0;   // curvature's share of the measure ≈ the floor
+  const Real CURV_WEIGHT = REPARAM_CURV;   // 0 ⇒ uniform arc length; >0 ⇒ adaptive
 
   std::vector<Real> L(n);             // geodesic edge lengths
   std::vector<Real> turn(n, 0.0);     // turning angle at each vertex
@@ -362,7 +416,13 @@ static void ohara_geometry(const std::vector<Real> &v4, int n,
     w[k] = 0.5 * (L[(k - 1 + n) % n] + L[k]);
 }
 
-Real compute_energy_ohara(const std::vector<Real> &v4, int n) {
+// Shared O'Hara energy evaluator.  `metric` selects ONLY the ambient distance
+// (geodesic d_S³=θ vs chordal |x−y|=2sin(θ/2)); everything else — the d_K arc
+// length, the Voronoi weights, the diagonal cutoff, the threading/quadrature —
+// is common code.  Defaults to Geodesic so every existing caller (optimiser,
+// gradient check, main) keeps computing E^{(2)}_{S³} exactly as before.
+Real compute_energy_ohara(const std::vector<Real> &v4, int n,
+                          AmbientMetric metric = AmbientMetric::Geodesic) {
   std::vector<Real> L, S, w;
   Real T;
   ohara_geometry(v4, n, L, S, w, T);
@@ -381,9 +441,10 @@ Real compute_energy_ohara(const std::vector<Real> &v4, int n) {
         Real theta = std::acos(c);
         if (theta < EPS)
           continue; // coincident: integrable singularity, drop the term
+        Real d_amb = ambient_dist(theta, metric); // ← the only swapped term
         Real fwd = S[j] - S[i];
         Real a = std::min(fwd, T - fwd);
-        acc += (1.0 / (theta * theta) - 1.0 / (a * a)) * w[i] * w[j];
+        acc += (1.0 / (d_amb * d_amb) - 1.0 / (a * a)) * w[i] * w[j];
       }
     }
     partial[tid] = acc;
@@ -532,6 +593,196 @@ void compute_gradient_ohara(const std::vector<Real> &v4, int n, Real *grad) {
       grad[4 * k + d] += coef * xp[d];
       grad[4 * kp + d] += coef * xk[d];
     }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §4q  Spherical QUANTITY energy  E_q = L⁻²·E_d  and its exact analytic gradient
+//
+//   E_q(K) = L⁻²·E_d(K),  L = total geodesic length = Σ_k arccos⟨x_k,x_{k+1}⟩.
+//   Product rule (validated against central finite differences via --gradcheck):
+//
+//     ∇_i E_q = L⁻² ∇_i E_d  −  2 E_d L⁻³ ∇_i L
+//
+//   ∇_i L = −x_{i−1}/sin L_{i−1} − x_{i+1}/sin L_i  is EXACTLY the per-edge length
+//   sweep at the tail of compute_gradient_ohara with the coefficient Γ_k ≡ 1.
+//   Both ∇E_d and ∇L are ambient ℝ⁴; projection onto T_xS³ is linear so we form
+//   the combination here and let the caller project once (same contract as
+//   compute_gradient_ohara).  E_d ≥ 0 and L > 0 ⇒ E_q ≥ 0.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Total geodesic length L = Σ_k arccos⟨x_k,x_{k+1}⟩.
+Real compute_length(const std::vector<Real> &v4, int n) {
+  Real T = 0.0;
+  for (int k = 0; k < n; ++k) {
+    int kp = (k + 1) % n;
+    Real c = std::max(-1.0, std::min(1.0, dot4(v4.data() + 4 * k,
+                                               v4.data() + 4 * kp)));
+    T += std::acos(c);
+  }
+  return T;
+}
+
+// Ambient ℝ⁴ gradient of the total length L.  Per edge k (L_k=arccos⟨x_k,x_{k+1}⟩):
+//   ∇_{x_k}L_k = −x_{k+1}/sin L_k,  ∇_{x_{k+1}}L_k = −x_k/sin L_k  (Γ_k ≡ 1).
+void compute_length_gradient(const std::vector<Real> &v4, int n, Real *gradL) {
+  for (int i = 0; i < n * 4; ++i) gradL[i] = 0.0;
+  for (int k = 0; k < n; ++k) {
+    int kp = (k + 1) % n;
+    Real c = std::max(-1.0, std::min(1.0, dot4(v4.data() + 4 * k,
+                                               v4.data() + 4 * kp)));
+    Real Lk = std::acos(c);
+    Real sin_L = std::sin(Lk);
+    if (sin_L <= EPS)
+      continue;
+    Real coef = -1.0 / sin_L;
+    const Real *xk = v4.data() + 4 * k;
+    const Real *xp = v4.data() + 4 * kp;
+    for (int d = 0; d < 4; ++d) {
+      gradL[4 * k + d] += coef * xp[d];
+      gradL[4 * kp + d] += coef * xk[d];
+    }
+  }
+}
+
+// E_q = L⁻²·E_d (geodesic density energy).  L>0 and E_d≥0 ⇒ E_q≥0.
+Real compute_energy_quantity(const std::vector<Real> &v4, int n) {
+  Real L = compute_length(v4, n);
+  Real Ed = compute_energy_ohara(v4, n); // geodesic E_d
+  Real Linv2 = (L > EPS) ? 1.0 / (L * L) : 0.0;
+  return Linv2 * Ed;
+}
+
+// ∇E_q = L⁻²∇E_d − 2 E_d L⁻³ ∇L  (ambient ℝ⁴; caller projects onto T_xS³).
+// ∇E_d and ∇L come from SEPARATE calls into SEPARATE buffers — no aliasing.
+void compute_gradient_quantity(const std::vector<Real> &v4, int n, Real *grad) {
+  Real L = compute_length(v4, n);
+  Real Ed = compute_energy_ohara(v4, n);
+  Real Linv = (L > EPS) ? 1.0 / L : 0.0;
+  Real Linv2 = Linv * Linv;
+  Real Linv3 = Linv2 * Linv;
+  compute_gradient_ohara(v4, n, grad); // grad ← ∇E_d (overwrites)
+  std::vector<Real> gL(n * 4, 0.0);
+  compute_length_gradient(v4, n, gL.data()); // gL ← ∇L
+  Real cL = -2.0 * Ed * Linv3;
+  for (int i = 0; i < n * 4; ++i)
+    grad[i] = Linv2 * grad[i] + cL * gL[i];
+}
+
+// ── Objective dispatchers: select density vs quantity by ENERGY_MODE ──────────
+// Every line-search / gradient / report site routes through these, so the
+// energy mode is chosen in exactly one place.  Diagnostic dual-energy callers
+// (--eval / --calibrate) bypass them and stay on the density evaluator.
+inline Real objective_energy(const std::vector<Real> &v4, int n) {
+  return (ENERGY_MODE == EnergyMode::Quantity) ? compute_energy_quantity(v4, n)
+                                               : compute_energy_ohara(v4, n);
+}
+inline void objective_gradient(const std::vector<Real> &v4, int n, Real *grad) {
+  if (ENERGY_MODE == EnergyMode::Quantity)
+    compute_gradient_quantity(v4, n, grad);
+  else
+    compute_gradient_ohara(v4, n, grad);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §4a'  Bending energy  ∫κ²ds  and its exact analytic ℝ⁴ gradient
+//
+//   κ_k = θ_k / w_k,  θ_k = angle between chord edges e0=x_k−x_{k−1},
+//   e1=x_{k+1}−x_k,   w_k = (L_{k−1}+L_k)/2 (geodesic Voronoi arc length).
+//   ∫κ²ds = Σ_k Φ(θ_k)/w_k,  Φ(θ)=θ² (default) or 4·tan²(θ/2) (blow-up form).
+//   Each term is LOCAL (touches only x_{k−1},x_k,x_{k+1}) ⇒ O(n) energy AND
+//   gradient (a 3-point stencil).  Gradient is ambient ℝ⁴; the caller projects
+//   onto T_xS³ (same contract as compute_gradient_ohara).
+// ═══════════════════════════════════════════════════════════════════════════
+
+inline Real bend_phi(Real theta) {            // Φ(θ)
+  if (BEND_FORM == BendForm::Tan2Half) {
+    Real t = std::tan(0.5 * theta);
+    return 4.0 * t * t;
+  }
+  return theta * theta;
+}
+inline Real bend_dphi(Real theta) {           // Φ'(θ)
+  if (BEND_FORM == BendForm::Tan2Half) {
+    Real cc = std::cos(0.5 * theta);
+    Real t  = std::tan(0.5 * theta);
+    return 4.0 * t / (cc * cc);               // 4 tan(θ/2) sec²(θ/2)
+  }
+  return 2.0 * theta;
+}
+
+Real compute_bending_energy(const std::vector<Real> &v4, int n) {
+  std::vector<Real> L, S, w;
+  Real T;
+  ohara_geometry(v4, n, L, S, w, T);
+  Real bend = 0.0;
+  for (int k = 0; k < n; ++k) {
+    int km = (k - 1 + n) % n, kp = (k + 1) % n;
+    Real e0[4], e1[4];
+    for (int d = 0; d < 4; ++d) {
+      e0[d] = v4[4 * k + d]  - v4[4 * km + d];
+      e1[d] = v4[4 * kp + d] - v4[4 * k + d];
+    }
+    Real n0 = norm_4(e0), n1 = norm_4(e1);
+    if (n0 <= EPS || n1 <= EPS) continue;
+    Real c = std::max(-1.0, std::min(1.0, dot4(e0, e1) / (n0 * n1)));
+    Real theta = std::acos(c);
+    Real wk = std::max(w[k], W_FLOOR);
+    bend += bend_phi(theta) / wk;
+  }
+  return bend;
+}
+
+void compute_bending_gradient(const std::vector<Real> &v4, int n, Real *grad) {
+  std::vector<Real> L, S, w;
+  Real T;
+  ohara_geometry(v4, n, L, S, w, T);
+  for (int i = 0; i < n * 4; ++i) grad[i] = 0.0;
+
+  for (int k = 0; k < n; ++k) {
+    int km = (k - 1 + n) % n, kp = (k + 1) % n;
+    const Real *xkm = v4.data() + 4 * km;
+    const Real *xk  = v4.data() + 4 * k;
+    const Real *xkp = v4.data() + 4 * kp;
+    Real e0[4], e1[4];
+    for (int d = 0; d < 4; ++d) { e0[d] = xk[d] - xkm[d]; e1[d] = xkp[d] - xk[d]; }
+    Real n0 = norm_4(e0), n1 = norm_4(e1);
+    if (n0 <= EPS || n1 <= EPS) continue;
+    Real eh0[4], eh1[4];
+    for (int d = 0; d < 4; ++d) { eh0[d] = e0[d] / n0; eh1[d] = e1[d] / n1; }
+    Real c = std::max(-1.0, std::min(1.0, dot4(eh0, eh1)));
+    Real theta = std::acos(c);
+    Real s = std::sqrt(std::max(0.0, 1.0 - c * c));
+    Real wk = std::max(w[k], W_FLOOR);
+
+    // θ-part:  grad += (Φ'/w)·∂θ/∂x = −(Φ'/(w·s))·∂c/∂x  ≡ −ath·∂c/∂x
+    //   A = ∂c/∂e0 = (ê1 − c ê0)/|e0|,   B = ∂c/∂e1 = (ê0 − c ê1)/|e1|
+    //   ∂c/∂x_{k−1}=−A,  ∂c/∂x_{k+1}=B,  ∂c/∂x_k=A−B.   (|A|,|B| ~ s, so finite at θ→0)
+    Real ath = (s > EPS) ? (bend_dphi(theta) / (wk * s)) : 0.0;
+    Real A[4], B[4];
+    for (int d = 0; d < 4; ++d) {
+      A[d] = (eh1[d] - c * eh0[d]) / n0;
+      B[d] = (eh0[d] - c * eh1[d]) / n1;
+    }
+    for (int d = 0; d < 4; ++d) {
+      grad[4 * km + d] +=  ath * A[d];
+      grad[4 * kp + d] += -ath * B[d];
+      grad[4 * k  + d] += -ath * (A[d] - B[d]);
+    }
+
+    // weight-part:  grad += β·∂w/∂x,  β=−Φ/w²,  ∂L/∂x = −x_other/sin L
+    Real bw  = -bend_phi(theta) / (wk * wk);
+    Real sLm = std::sin(L[km]), sLk = std::sin(L[k]);
+    if (sLm > EPS)
+      for (int d = 0; d < 4; ++d) {
+        grad[4 * km + d] += bw * (-xk[d]  / (2.0 * sLm));
+        grad[4 * k  + d] += bw * (-xkm[d] / (2.0 * sLm));
+      }
+    if (sLk > EPS)
+      for (int d = 0; d < 4; ++d) {
+        grad[4 * kp + d] += bw * (-xk[d]  / (2.0 * sLk));
+        grad[4 * k  + d] += bw * (-xkp[d] / (2.0 * sLk));
+      }
   }
 }
 
@@ -1011,6 +1262,27 @@ void gradient_descent(std::vector<Real> &v4, // in/out: S³ vertices [n×4]
   auto mesh_ptr = build_mesh(mesh_fac, v4, n, thread_count);
   auto &M = *mesh_ptr;
 
+  // ── Quantity-mode scaling & length baseline ──────────────────────────────
+  // E_q = L⁻²E_d ⇒ ∇E_q ≈ ∇E_d/L² (~L²× smaller).  Scale the initial step by L₀²
+  // so the step GEOMETRY matches density mode on iteration 1 (the tunnel-proof
+  // cap stays the upper guard), and tighten the |∇| stop threshold by L₀² so it
+  // tests the same effective criticality.  L₀ also anchors the runaway guard.
+  const Real L0 = compute_length(v4, n);
+  Real GTOL = 1e-10;
+  if (ENERGY_MODE == EnergyMode::Quantity) {
+    Real L0sq = std::max(EPS, L0 * L0);
+    alpha0 *= L0sq;
+    GTOL = 1e-10 / L0sq;
+    std::cout << "  Energy   : QUANTITY  E_q = L⁻²·E_{S³}   L₀=" << L0
+              << "  (α₀·L₀²=" << alpha0 << ", |∇| tol=" << GTOL << ")\n";
+  }
+  // Length runaway watch: a single, interpretable guard — stop if L ever
+  // exceeds LEN_RUNAWAY·L₀ (default 4×, set via --len-cap).  A curve still in
+  // normal early relaxation lengthens monotonically for many iterations before
+  // it plateaus (the bigger the knot, the longer that takes), so a
+  // "consecutive rises" heuristic would false-fire; only a large multiplicative
+  // blow-up is a genuine discretisation-driven runaway.
+
   // ── Gradient buffers ─────────────────────────────────────────────────
   Mesh_T::CotangentVector_T diff(n, AMB_DIM);  // L² gradient (cotangent)
   Mesh_T::TangentVector_T g_sob(n, AMB_DIM);   // Sobolev gradient
@@ -1020,7 +1292,7 @@ void gradient_descent(std::vector<Real> &v4, // in/out: S³ vertices [n×4]
   std::ofstream log(log_path);
   if (!log)
     throw std::runtime_error("Cannot write: " + log_path);
-  log << "iteration,energy,gradient_norm,step_size\n";
+  log << "iteration,energy,gradient_norm,step_size,total_length\n";
   log << std::setprecision(12) << std::scientific;
 
   // ── Trajectory file for the live viewer (--frames K) ───────────────────
@@ -1101,9 +1373,11 @@ void gradient_descent(std::vector<Real> &v4, // in/out: S³ vertices [n×4]
     M.SemiStaticUpdate(new_pos.data());
   }
 
-  // Geodesic energy at the current iterate. Updated incrementally on step
-  // acceptance so it is computed exactly once per configuration.
-  Real E = compute_energy_ohara(v4, n);
+  // E holds the OPTIMISER OBJECTIVE F = E_geo + C·∫κ²ds (so the line search and
+  // convergence act on F); E_geo tracks the pure O'Hara value for logging. Both
+  // are (re)set per continuation level in the outer loop below.
+  Real E = 0.0, E_geo = 0.0;
+  std::vector<Real> gb(n * 4, 0.0);   // bending-gradient scratch (reused each iter)
 
   // ── Tunnel-proof step cap ────────────────────────────────────────────────
   // No static collision constraint (it froze the flow far short of the
@@ -1123,14 +1397,46 @@ void gradient_descent(std::vector<Real> &v4, // in/out: S³ vertices [n×4]
   // vertices (it gets points ∝ its arc length), which is what lets it drop
   // below the resolution needed to hold its crossings and untie.
 
-  for (int iter = 0; iter <= max_iter; ++iter) {
+  // ── O'Hara bending continuation: minimise F = E + C·∫κ²ds over a decreasing
+  // schedule of C, warm-starting each level from the previous, ending at C=0
+  // (which recovers the pure O'Hara minimiser).  BEND_REL=0 ⇒ single C=0 level
+  // = the original pure-O'Hara behaviour.
+  std::vector<Real> C_levels;
+  if (BEND_REL > 0.0) {
+    Real bend0 = compute_bending_energy(v4, n);
+    Real Eohara0 = objective_energy(v4, n);
+    Real C_start = (bend0 > EPS) ? BEND_REL * Eohara0 / bend0 : 0.0;
+    for (Real C = C_start; C > C_start * C_MIN_FRAC && C > 0.0; C *= BEND_DECAY)
+      C_levels.push_back(C);
+    if (!BEND_HOLD) C_levels.push_back(0.0);   // --bend-hold: keep the finite floor
+    std::cout << "  Bending  : F=E+C·∫κ²ds, " << C_levels.size() << " levels, C_start="
+              << std::setprecision(6) << C_start << " (rel " << BEND_REL << "), form="
+              << (BEND_FORM == BendForm::Tan2Half ? "tan2" : "theta2") << "\n";
+  } else {
+    C_levels.push_back(0.0);
+  }
+
+  for (size_t lvl = 0; lvl < C_levels.size(); ++lvl) {
+    BENDING_C = C_levels[lvl];
+    alpha = alpha0;
+    no_progress = 0;
+    std::fill(mom.begin(), mom.end(), 0.0);
+    E_geo = objective_energy(v4, n);
+    E = E_geo + BENDING_C * compute_bending_energy(v4, n);
+    if (C_levels.size() > 1)
+      std::cout << "\n── bending level " << (lvl + 1) << "/" << C_levels.size()
+                << "  C=" << std::setprecision(6) << BENDING_C
+                << "  E_geo=" << E_geo << " ──\n";
+
+   for (int iter = 0; iter <= max_iter; ++iter) {
 
     if (REPARAM_EVERY > 0 && iter > 0 && iter % REPARAM_EVERY == 0) {
       reparametrize_s3(v4, n);
       for (int i = 0; i < n * AMB_DIM; ++i) new_pos.data()[i] = v4[i];
       M.SemiStaticUpdate(new_pos.data());
       std::fill(mom.begin(), mom.end(), 0.0);
-      E = compute_energy_ohara(v4, n);
+      E_geo = objective_energy(v4, n);
+      E = E_geo + BENDING_C * compute_bending_energy(v4, n);
     }
 
     // avg edge length (for diagnostics) + global strand gap (for the cap)
@@ -1143,6 +1449,9 @@ void gradient_descent(std::vector<Real> &v4, // in/out: S³ vertices [n×4]
     }
     avg_edge_len /= n;
     g_min = global_min_gap(v4, n);
+    // current total geodesic length: logged, and watched for runaway (E_q can
+    // try to lower L⁻²E_d by lengthening, and a curve on S³ has no length bound).
+    Real Lcur = compute_length(v4, n);
     if (iter == 0)
       std::cout << "  step cap : " << STEP_CAP_FRAC * g_min
                 << "  (min strand gap: " << g_min
@@ -1161,7 +1470,14 @@ void gradient_descent(std::vector<Real> &v4, // in/out: S³ vertices [n×4]
     else
       (void)E_bh.Differential(M, diff.data());
 
-    compute_gradient_ohara(v4, n, diff.data());
+    objective_gradient(v4, n, diff.data());
+
+    // Add the bending gradient C·∇∫κ²ds so `diff` becomes ∇F (ambient ℝ⁴); the
+    // projection, gnorm and the line-search `descent` below then all reflect F.
+    if (BENDING_C != 0.0) {
+      compute_bending_gradient(v4, n, gb.data());
+      for (int i = 0; i < n * AMB_DIM; ++i) diff.data()[i] += BENDING_C * gb[i];
+    }
 
     // Project diff onto T_{x_k}S³
     for (int k = 0; k < n; ++k) {
@@ -1176,17 +1492,34 @@ void gradient_descent(std::vector<Real> &v4, // in/out: S³ vertices [n×4]
       gnorm += diff.data()[i] * diff.data()[i];
     gnorm = std::sqrt(gnorm);
 
-    log << iter << "," << E << "," << gnorm << "," << alpha << "\n";
+    log << iter << "," << E << "," << gnorm << "," << alpha << "," << Lcur
+        << "\n";
 
     if (traj.is_open() && (iter % FRAME_EVERY == 0 || iter == max_iter))
       write_frame(traj, v4, n, iter, E);
 
-    if (iter % 50 == 0 || iter == max_iter)
+    if (iter % 50 == 0 || iter == max_iter) {
       std::cout << "iter " << std::setw(5) << iter
-                << "  E_geo=" << std::setprecision(8) << E << "  |g|=" << gnorm
-                << "  α=" << alpha << "\n";
+                << (ENERGY_MODE == EnergyMode::Quantity ? "  E_q=" : "  E_geo=")
+                << std::setprecision(8) << E_geo;
+      if (BENDING_C != 0.0) std::cout << "  F=" << E;
+      std::cout << "  |g|=" << gnorm << "  α=" << alpha << "  L=" << Lcur << "\n";
+    }
 
-    if (gnorm < 1e-10 || iter == max_iter)
+    // ── Length runaway soft-stop (the "length explodes to ∞" worry) ──────────
+    // E_q has a finite continuous minimiser (O'Hara §5 / Table 5.1), so true
+    // L→∞ is precluded; a drift here is a discretisation artefact at fixed n.
+    // Stop and report — do NOT penalise L in the objective (that would change
+    // the functional and break the Table 5.1 benchmark).
+    if (Lcur > LEN_RUNAWAY * L0) {
+      std::cout << "\n  *** STOP at iter " << iter << ": length L=" << Lcur
+                << " exceeded " << LEN_RUNAWAY << "×L₀ (=" << LEN_RUNAWAY * L0
+                << ") — likely discretisation-driven runaway; raise N, or "
+                   "--len-cap to allow more growth ***\n";
+      break;
+    }
+
+    if (gnorm < GTOL || iter == max_iter)
       break;
 
     // ── 3. Sobolev H^{1/2} preconditioning ───────────────────────────
@@ -1312,9 +1645,12 @@ void gradient_descent(std::vector<Real> &v4, // in/out: S³ vertices [n×4]
           for (int d = 0; d < 4; ++d) v4_cand[4 * k + d] = q[d];
         }
 
-        // strict sufficient decrease of the geodesic energy
-        Real E_geo_trial = compute_energy_ohara(v4_cand, n);
-        if (E_geo_trial > E - ARMIJO_C * alpha_try * descent) {
+        // strict sufficient decrease of the OBJECTIVE F = E_obj + C·bend
+        // (E_obj = E_d in density mode, E_q = L⁻²E_d in quantity mode)
+        Real E_geo_trial = objective_energy(v4_cand, n);
+        Real F_trial = E_geo_trial +
+            (BENDING_C != 0.0 ? BENDING_C * compute_bending_energy(v4_cand, n) : 0.0);
+        if (F_trial > E - ARMIJO_C * alpha_try * descent) {
           alpha_try *= 0.5;
           continue;
         }
@@ -1325,7 +1661,7 @@ void gradient_descent(std::vector<Real> &v4, // in/out: S³ vertices [n×4]
         // stereographic image, where knotting actually lives — the old ℝ⁴-chord
         // gap test let crossings slip through). Forbidding the crossing event
         // itself is tunnel-proof at any step size and never freezes.
-        if (any_self_passage(v4, v4_cand, n)) {
+        if (GUARD_ENABLED && any_self_passage(v4, v4_cand, n)) {
           alpha_try *= 0.5;
           continue;
         }
@@ -1339,7 +1675,8 @@ void gradient_descent(std::vector<Real> &v4, // in/out: S³ vertices [n×4]
           }
         }
         v4 = v4_cand;
-        E_new = E_geo_trial;
+        E_new = F_trial;        // objective F at the accepted iterate
+        E_geo = E_geo_trial;    // pure O'Hara value (for logging)
         for (int i = 0; i < n * AMB_DIM; ++i) new_pos.data()[i] = v4[i];
         M.SemiStaticUpdate(new_pos.data());
         accepted = true;
@@ -1368,9 +1705,70 @@ void gradient_descent(std::vector<Real> &v4, // in/out: S³ vertices [n×4]
                 << MAX_NO_PROGRESS << " consecutive iterations) ***\n";
       break;
     }
-  }
+   }  // inner iteration loop
+  }    // outer bending-continuation loop (C levels)
 
   log.close();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §6a  Dual-energy evaluation modes  (--eval / --calibrate)
+//
+// Re-evaluate an already-converged curve under BOTH ambient distances without
+// minimising.  The two numbers come from the SAME compute_energy_ohara() with
+// only the AmbientMetric flag swapped, so the comparison is apples-to-apples.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Round great circle on S³: n vertices on the unit circle in the (e₀,e₁) plane.
+// This is a geodesic of S³, so its S³-geodesic chord equals its intrinsic arc
+// length d_K everywhere ⇒ the geodesic integrand is 0 termwise and E_geo ≈ 0.
+// The chordal energy is then the round-circle Möbius value (≈ 4 in this
+// convention) — the calibration constant to eyeball.
+static std::vector<Real> great_circle_s3(int n) {
+  const Real two_pi = 6.283185307179586476925286766559;
+  std::vector<Real> v4(n * 4, 0.0);
+  for (int i = 0; i < n; ++i) {
+    Real t = two_pi * (Real)i / (Real)n;
+    v4[4 * i + 0] = std::cos(t);
+    v4[4 * i + 1] = std::sin(t);
+  }
+  return v4;
+}
+
+// (p,q) torus knot on the Clifford torus of radius r (O'Hara §5.2 generalised):
+//   τ_r(θ) = (r cos pθ, r sin pθ, √(1−r²) cos qθ, √(1−r²) sin qθ) ∈ S³ ⊂ ℂ².
+// Sampled uniformly in θ (the discrete energy's Voronoi weights make it
+// arc-length-correct regardless of the θ-spacing).  For (2,3) this reproduces
+// the paper's Table 5.1:  E_d min 54.3263 @ r≈0.8614,  E_q min 0.245251 @ r≈0.7762.
+static std::vector<Real> clifford_pq_s3(int p, int q, Real r, int n) {
+  const Real two_pi = 6.283185307179586476925286766559;
+  Real s = std::sqrt(std::max(0.0, 1.0 - r * r));
+  std::vector<Real> v4(n * 4);
+  for (int i = 0; i < n; ++i) {
+    Real th = two_pi * (Real)i / (Real)n;
+    v4[4 * i + 0] = r * std::cos(p * th);
+    v4[4 * i + 1] = r * std::sin(p * th);
+    v4[4 * i + 2] = s * std::cos(q * th);
+    v4[4 * i + 3] = s * std::sin(q * th);
+  }
+  return v4;
+}
+static std::vector<Real> clifford_trefoil_s3(Real r, int n) {
+  return clifford_pq_s3(2, 3, r, n);
+}
+
+// Print both energies for an S³ vertex set in a stable, machine-parseable line.
+static void print_dual_energy(const std::string &tag, const std::vector<Real> &v4,
+                              int n) {
+  Real e_geo = compute_energy_ohara(v4, n, AmbientMetric::Geodesic);
+  Real e_chd = compute_energy_ohara(v4, n, AmbientMetric::Chordal);
+  Real ratio = (std::fabs(e_geo) > 1e-9) ? e_chd / e_geo
+                                         : std::numeric_limits<Real>::quiet_NaN();
+  std::cout << std::setprecision(10)
+            << "DUAL " << tag << " n=" << n
+            << " E_geo=" << e_geo
+            << " E_chordal=" << e_chd
+            << " ratio=" << ratio << "\n";
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1382,9 +1780,114 @@ int main(int argc, char **argv) {
 
   G_THREADS = std::max(1u, std::thread::hardware_concurrency());
 
-  if (argc < 4) {
+  // ── Dual-energy evaluation modes (no minimisation) ──────────────────────────
+  //   --calibrate [n]        : great-circle unknot; prints E_geo (≈0) & E_chordal
+  //   --eval <a.vect> [b...]  : re-evaluate each converged .vect under BOTH
+  //                             energies.  The .vect is the ℝ³ stereographic
+  //                             image of a converged S³ curve, so we lift it back
+  //                             with the EXACT inverse (r3_to_s3) — no centre/
+  //                             scale step, which would distort the S³ geometry.
+  for (int i = 1; i < argc; ++i) {
+    std::string a = argv[i];
+    if (a == "--calibrate") {
+      int nc = (i + 1 < argc) ? std::max(8, std::atoi(argv[i + 1])) : 400;
+      std::vector<Real> v4 = great_circle_s3(nc);
+      std::cout << "Calibration — round great-circle unknot (n=" << nc << "):\n";
+      std::cout << "  expect E_geo ≈ 0 (great circle is an S³ geodesic, "
+                   "d_S³ = d_K)\n";
+      std::cout << "  expect E_chordal ≈ round-circle Möbius value (~4 in this "
+                   "convention)\n";
+      print_dual_energy("great_circle", v4, nc);
+      return 0;
+    }
+    if (a == "--cliffordtable") {
+      // Reproduce O'Hara Table 5.1: E_d and E_q of the trefoil on Clifford tori
+      // T_r over a sweep of r.  Validates the quantity energy against published
+      // numbers (E_q min 0.245251 @ r≈0.776246; E_d min 54.3263 @ r≈0.861388).
+      int nc = (i + 1 < argc) ? std::max(8, std::atoi(argv[i + 1])) : 2000;
+      static const Real rs[] = {0.10, 0.15, 0.20, 0.25, 0.30, 0.35,     0.40,
+                                0.45, 0.50, 0.55, 0.60, 0.65, 0.70,     0.75,
+                                0.776246, 0.80, 0.85, 0.861388, 0.90,   0.95,
+                                0.99};
+      std::cout << "Clifford-torus (2,3) trefoils  τ_r   (n=" << nc << ")\n";
+      std::cout << "  paper Table 5.1:  E_d min 54.3263 @ r≈0.861388,  "
+                   "E_q min 0.245251 @ r≈0.776246\n";
+      std::cout << std::fixed << std::setprecision(6)
+                << "      r          L            E_d              E_q\n";
+      for (Real r : rs) {
+        std::vector<Real> v4 = clifford_trefoil_s3(r, nc);
+        Real L = compute_length(v4, nc);
+        Real Ed = compute_energy_ohara(v4, nc);
+        Real Eq = (L > EPS) ? Ed / (L * L) : 0.0;
+        std::cout << "  " << std::setw(8) << r << "   " << std::setw(9) << L
+                  << "   " << std::setw(12) << Ed << "   " << std::setw(10) << Eq
+                  << "\n";
+      }
+      return 0;
+    }
+    if (a == "--cliffordscan") {
+      // --cliffordscan p q [n]: scan the radius r for T(p,q) ON the Clifford
+      // torus T_r and print E_d, E_q at each r, reporting the r that minimises
+      // each.  The min-over-r E_q is the BEST energy any on-Clifford placement
+      // can achieve; comparing it to a free minimisation's E_q decides whether
+      // the true minimiser lies on the Clifford torus (free ≥ this ⇒ on it;
+      // free strictly below ⇒ the minimiser genuinely leaves the torus).
+      if (i + 2 >= argc) {
+        std::cerr << "Usage: energy_s3 --cliffordscan p q [n]\n";
+        return 1;
+      }
+      int p = std::atoi(argv[i + 1]), q = std::atoi(argv[i + 2]);
+      int nc = (i + 3 < argc && argv[i + 3][0] != '-')
+                   ? std::max(8, std::atoi(argv[i + 3])) : 3000;
+      std::cout << "Clifford scan  T(" << p << "," << q << ")   (n=" << nc
+                << ")\n" << std::fixed << std::setprecision(6)
+                << "      r          L            E_d              E_q\n";
+      Real bEq = 1e30, bEqr = 0, bEd = 1e30, bEdr = 0;
+      for (int k = 1; k <= 98; ++k) {
+        Real r = 0.01 * k;
+        std::vector<Real> v4 = clifford_pq_s3(p, q, r, nc);
+        Real L = compute_length(v4, nc);
+        Real Ed = compute_energy_ohara(v4, nc);
+        Real Eq = (L > EPS) ? Ed / (L * L) : 0.0;
+        if (Eq < bEq) { bEq = Eq; bEqr = r; }
+        if (Ed < bEd) { bEd = Ed; bEdr = r; }
+        if (k % 3 == 0)
+          std::cout << "  " << std::setw(8) << r << "   " << std::setw(9) << L
+                    << "   " << std::setw(12) << Ed << "   " << std::setw(10)
+                    << Eq << "\n";
+      }
+      std::cout << "MIN  E_d=" << bEd << " @ r=" << bEdr << "    E_q=" << bEq
+                << " @ r=" << bEqr << "\n";
+      return 0;
+    }
+    if (a == "--eval") {
+      if (i + 1 >= argc) {
+        std::cerr << "Usage: energy_s3 --eval <a.vect> [b.vect ...]\n";
+        return 1;
+      }
+      for (int k = i + 1; k < argc; ++k) {
+        int n = 0;
+        std::vector<Real> pts_r3 = read_vect(argv[k], n);
+        std::vector<Real> v4(n * 4);
+        for (int v = 0; v < n; ++v)
+          r3_to_s3(pts_r3.data() + 3 * v, v4.data() + 4 * v);
+        print_dual_energy(argv[k], v4, n);
+      }
+      return 0;
+    }
+  }
+
+  // --gradcheck needs only the input .vect, so the positional-arg requirement
+  // depends on the mode (scan before the consuming flag-parse loop below).
+  bool want_gradcheck = false;
+  for (int i = 1; i < argc; ++i)
+    if (std::string(argv[i]) == "--gradcheck") want_gradcheck = true;
+  if (argc < (want_gradcheck ? 2 : 4)) {
     std::cerr << "Usage: energy_s3 <input.vect> <energy_log.csv> <output.vect>"
-                 " [max_iter=500] [step=0.01] [--ccd]\n";
+                 " [max_iter=500] [step=0.01] [--energy density|quantity] "
+                 "[--len-cap f] [--ccd]\n"
+                 "       energy_s3 <input.vect> --gradcheck [--energy quantity]"
+                 " [--bend c]\n";
     return 1;
   }
 
@@ -1392,9 +1895,12 @@ int main(int argc, char **argv) {
   // Parse flags anywhere in args: --ccd, --gradcheck, --frames K
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
-    if (a == "--ccd" || a == "--gradcheck" || a == "--no-normalize") {
+    if (a == "--ccd" || a == "--gradcheck" || a == "--no-normalize" ||
+        a == "--no-guard" || a == "--bend-hold") {
       if (a == "--ccd") CCD_ENABLED = true;
       else if (a == "--no-normalize") NORMALIZE = false;
+      else if (a == "--no-guard") GUARD_ENABLED = false;
+      else if (a == "--bend-hold") BEND_HOLD = true;
       else gradcheck = true;
       for (int j = i; j < argc - 1; ++j) argv[j] = argv[j + 1];
       --argc;
@@ -1413,6 +1919,39 @@ int main(int argc, char **argv) {
       for (int j = i; j < argc - consume; ++j) argv[j] = argv[j + consume];
       argc -= consume;
       --i;
+    } else if (a == "--bend" || a == "--bend-decay" || a == "--bend-min" ||
+               a == "--reparam-curv" || a == "--len-cap") {
+      // Bending continuation params + reparam curvature weight + length cap (float).
+      Real val = (i + 1 < argc) ? std::atof(argv[i + 1]) : 0.0;
+      if (a == "--bend") BEND_REL = std::max(0.0, val);
+      else if (a == "--bend-decay") BEND_DECAY = std::min(0.99, std::max(0.05, val));
+      else if (a == "--reparam-curv") REPARAM_CURV = std::max(0.0, val);
+      else if (a == "--len-cap") LEN_RUNAWAY = std::max(1.0, val);
+      else C_MIN_FRAC = std::max(0.0, val);
+      int consume = (i + 1 < argc) ? 2 : 1;
+      for (int j = i; j < argc - consume; ++j) argv[j] = argv[j + consume];
+      argc -= consume;
+      --i;
+    } else if (a == "--bendform") {
+      // theta2 (Φ=θ²) | tan2 (Φ=4tan²(θ/2), blow-up preserving).
+      if (i + 1 < argc && std::string(argv[i + 1]) == "tan2")
+        BEND_FORM = BendForm::Tan2Half;
+      else
+        BEND_FORM = BendForm::Theta2;
+      int consume = (i + 1 < argc) ? 2 : 1;
+      for (int j = i; j < argc - consume; ++j) argv[j] = argv[j + consume];
+      argc -= consume;
+      --i;
+    } else if (a == "--energy") {
+      // density (default, E^(2)_{S³}) | quantity (E_q = L⁻²·E_{S³}).
+      if (i + 1 < argc && std::string(argv[i + 1]) == "quantity")
+        ENERGY_MODE = EnergyMode::Quantity;
+      else
+        ENERGY_MODE = EnergyMode::Density;
+      int consume = (i + 1 < argc) ? 2 : 1;
+      for (int j = i; j < argc - consume; ++j) argv[j] = argv[j + consume];
+      argc -= consume;
+      --i;
     }
   }
 
@@ -1423,8 +1962,25 @@ int main(int argc, char **argv) {
     std::vector<Real> v4(n * 4);
     for (int i = 0; i < n; ++i)
       r3_to_s3(pts_r3.data() + 3 * i, v4.data() + 4 * i);
+
+    // If --bend was given, check the FULL ∇F = ∇E + C·∇∫κ²ds (auto-scaled C, same
+    // as the optimiser's first level); otherwise check the pure O'Hara gradient.
+    if (BEND_REL > 0.0) {
+      Real bend0 = compute_bending_energy(v4, n);
+      Real E0b = objective_energy(v4, n);
+      BENDING_C = (bend0 > EPS) ? BEND_REL * E0b / bend0 : 0.0;
+      std::cout << "Gradient check on F = E + C·∫κ²ds   C=" << BENDING_C
+                << "   form=" << (BEND_FORM == BendForm::Tan2Half ? "tan2" : "theta2")
+                << "\n";
+    }
+
     std::vector<Real> g(n * 4);
-    compute_gradient_ohara(v4, n, g.data());
+    objective_gradient(v4, n, g.data());
+    if (BENDING_C != 0.0) {
+      std::vector<Real> gb(n * 4);
+      compute_bending_gradient(v4, n, gb.data());
+      for (int i = 0; i < n * 4; ++i) g[i] += BENDING_C * gb[i];
+    }
     // Project analytic gradient onto T_xS³ for fair comparison
     for (int k = 0; k < n; ++k) {
       Real tmp[4];
@@ -1440,8 +1996,11 @@ int main(int argc, char **argv) {
         std::vector<Real> vp = v4, vm = v4;
         vp[4 * k + d] += h; normalise4(vp.data() + 4 * k);
         vm[4 * k + d] -= h; normalise4(vm.data() + 4 * k);
-        Real fd = (compute_energy_ohara(vp, n) -
-                   compute_energy_ohara(vm, n)) / (2 * h);
+        Real fp = objective_energy(vp, n) +
+            (BENDING_C != 0.0 ? BENDING_C * compute_bending_energy(vp, n) : 0.0);
+        Real fm = objective_energy(vm, n) +
+            (BENDING_C != 0.0 ? BENDING_C * compute_bending_energy(vm, n) : 0.0);
+        Real fd = (fp - fm) / (2 * h);
         // Tangential part of the finite-difference direction
         Real an = g[4 * k + d];
         num += (fd - an) * (fd - an);
@@ -1449,7 +2008,10 @@ int main(int argc, char **argv) {
         max_abs = std::max(max_abs, std::fabs(fd - an));
       }
     }
-    std::cout << "Gradient check (n=" << n << ", h=" << h << "):\n"
+    std::cout << "Gradient check ["
+              << (ENERGY_MODE == EnergyMode::Quantity ? "E_q = L⁻²·E_{S³}"
+                                                      : "E^(2)_{S³}")
+              << "] (n=" << n << ", h=" << h << "):\n"
               << "  relative L2 error : " << std::sqrt(num / (den + EPS)) << "\n"
               << "  max abs error     : " << max_abs << "\n";
     return 0;
@@ -1468,7 +2030,11 @@ int main(int argc, char **argv) {
                 "trajectory.jsonl";
   }
 
-  std::cout << "S³ O'Hara Energy Minimiser  E^(2)_{S³}\n";
+  std::cout << "S³ O'Hara Energy Minimiser  "
+            << (ENERGY_MODE == EnergyMode::Quantity
+                    ? "E_q = L⁻²·E_{S³} (quantity)"
+                    : "E^(2)_{S³} (density)")
+            << "\n";
   std::cout << "═══════════════════════════════════════════\n";
   std::cout << "  Input    : " << in_path << "\n";
   std::cout << "  Log      : " << log_path << "\n";
@@ -1532,16 +2098,18 @@ int main(int argc, char **argv) {
   for (int i = 0; i < n; ++i)
     r3_to_s3(pts_r3.data() + 3 * i, v4.data() + 4 * i);
 
-  Real E0 = compute_energy_ohara(v4, n);
-  std::cout << "Initial E^(2)_{S³} energy: " << std::setprecision(10) << E0
-            << "\n\n";
+  Real E0 = objective_energy(v4, n);
+  std::cout << "Initial "
+            << (ENERGY_MODE == EnergyMode::Quantity ? "E_q" : "E^(2)_{S³}")
+            << " energy: " << std::setprecision(10) << E0 << "\n\n";
 
   // Run
   gradient_descent(v4, n, log_path, max_iter, alpha0);
 
-  Real Ef = compute_energy_ohara(v4, n);
-  std::cout << "\nFinal   E^(2)_{S³} energy : " << std::setprecision(10) << Ef
-            << "\n";
+  Real Ef = objective_energy(v4, n);
+  std::cout << "\nFinal   "
+            << (ENERGY_MODE == EnergyMode::Quantity ? "E_q" : "E^(2)_{S³}")
+            << " energy : " << std::setprecision(10) << Ef << "\n";
   std::cout << "Reduction             : " << std::setprecision(4) << E0 / Ef
             << "×  (" << 100.0 * (1.0 - Ef / E0) << "% decrease)\n";
 

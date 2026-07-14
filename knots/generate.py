@@ -81,6 +81,134 @@ def torus_knot_s3(p: int, q: int, n_points: int = 200,
     return out
 
 
+def _segseg_min_dists(P: np.ndarray) -> np.ndarray:
+    """Minimum distances between every pair of NON-adjacent closed-polyline
+    segments of P (n,4 in R⁴).  Returns the array of pairwise minima.
+
+    Used as the topology gate for the random walk: a deformation that never
+    lets two segments touch is an ambient isotopy, so the knot type cannot
+    change.  Clamped closest-point-between-segments (Ericson, RTCD §5.1.9),
+    vectorised over all candidate pairs.
+    """
+    n = len(P)
+    A = P
+    B = np.roll(P, -1, axis=0)          # segment i is A[i] -> B[i]
+    d = B - A                           # (n,4) direction vectors
+
+    # Candidate pairs (i,j), i<j, excluding adjacency on the closed loop.
+    i, j = np.triu_indices(n, k=1)
+    adj = (j == i + 1) | ((i == 0) & (j == n - 1))
+    i, j = i[~adj], j[~adj]
+
+    d1, d2 = d[i], d[j]
+    r = A[i] - A[j]
+    a = np.einsum("ij,ij->i", d1, d1)
+    e = np.einsum("ij,ij->i", d2, d2)
+    f = np.einsum("ij,ij->i", d2, r)
+    c = np.einsum("ij,ij->i", d1, r)
+    b = np.einsum("ij,ij->i", d1, d2)
+    denom = a * e - b * b
+
+    s = np.where(denom > 1e-12, (b * f - c * e) / np.where(denom > 1e-12, denom, 1.0), 0.0)
+    s = np.clip(s, 0.0, 1.0)
+    t = (b * s + f) / np.where(e > 1e-12, e, 1.0)
+    t = np.clip(t, 0.0, 1.0)
+    s = np.clip((b * t - c) / np.where(a > 1e-12, a, 1.0), 0.0, 1.0)
+
+    cp1 = A[i] + s[:, None] * d1
+    cp2 = A[j] + t[:, None] * d2
+    return np.linalg.norm(cp1 - cp2, axis=1)
+
+
+def _seg_clearance_at(P: np.ndarray, k: int) -> float:
+    """Min distance from the two segments incident to vertex k —
+    (k-1,k) and (k,k+1) — to every non-adjacent segment.  O(n) gate for a
+    single-vertex move."""
+    n = len(P)
+    A = P
+    B = np.roll(P, -1, axis=0)
+    best = np.inf
+    for si in ((k - 1) % n, k % n):       # the two segments that moved
+        d1 = B[si] - A[si]
+        # all segments except si and its two loop-neighbours
+        js = [j for j in range(n) if j not in (si, (si - 1) % n, (si + 1) % n)]
+        Aj, Bj = A[js], B[js]
+        d2 = Bj - Aj
+        r = A[si] - Aj
+        a = float(d1 @ d1)
+        e = np.einsum("ij,ij->i", d2, d2)
+        f = np.einsum("ij,ij->i", d2, r)
+        c = d1 @ r.T
+        b = d2 @ d1
+        denom = a * e - b * b
+        s = np.where(denom > 1e-12, (b * f - c * e) / np.where(denom > 1e-12, denom, 1.0), 0.0)
+        s = np.clip(s, 0.0, 1.0)
+        t = np.clip((b * s + f) / np.where(e > 1e-12, e, 1.0), 0.0, 1.0)
+        s = np.clip((b * t - c) / a, 0.0, 1.0)
+        cp1 = A[si] + s[:, None] * d1
+        cp2 = Aj + t[:, None] * d2
+        best = min(best, float(np.linalg.norm(cp1 - cp2, axis=1).min()))
+    return best
+
+
+def random_walk_knot(base_r3: np.ndarray, steps: int, amp: float,
+                     seed: int, clearance: float = 0.04) -> np.ndarray:
+    """Diffuse `base_r3` (n,3 in R³) far from its starting embedding via a
+    topology-preserving random walk.
+
+    The walk runs on the SAME geometry everything downstream uses — straight
+    R³ segments of the stereographic image (what the .vect file stores and what
+    knot_check evaluates).  Stereographic projection is a bijection
+    R³ ↔ S³∖{N}, so any embedded R³ polyline is a valid S³ knot.
+
+    Single-vertex Monte Carlo: each step jitters ONE random vertex (Gaussian
+    scale `amp`).  The move is ACCEPTED only if the two incident segments keep
+    clearance > `clearance` from all other strands.  No-tunnelling guarantee:
+    every move is also capped at displacement < clearance/2, so the swept motion
+    can never reach a strand that stays ≥ clearance away — no crossing is
+    geometrically possible and the knot type is preserved exactly.
+    """
+    rng = np.random.default_rng(seed)
+    pts = base_r3.copy()
+    n = len(pts)
+    step_cap = 0.5 * clearance
+    accepted = 0
+    for _ in range(steps):
+        k = int(rng.integers(n))
+        old = pts[k].copy()
+        delta = rng.normal(scale=amp, size=3)
+        if np.linalg.norm(delta) >= step_cap:         # too big a jump — could tunnel
+            continue
+        pts[k] = old + delta
+        if _seg_clearance_at(pts, k) > clearance:
+            accepted += 1
+        else:
+            pts[k] = old                              # revert
+    drift = float(np.linalg.norm(pts - base_r3, axis=1).mean())
+    print(f"  random walk: {accepted}/{steps} vertex moves accepted, "
+          f"mean R³ drift {drift:.3f}", file=sys.stderr)
+    return pts
+
+
+def upsample_r3(pts: np.ndarray, n_target: int) -> np.ndarray:
+    """Resample a closed R³ polyline to `n_target` vertices at EQUAL arc length.
+
+    New vertices lie ON the existing segments (piecewise-linear interpolation),
+    so the embedded curve is unchanged — same knot type, just finer.  This lets
+    us random-walk cheaply at low N (large safe steps → far from the torus) and
+    then densify for an accurate energy minimisation.
+    """
+    seg = np.linalg.norm(np.roll(pts, -1, axis=0) - pts, axis=1)   # closed edges
+    cum = np.concatenate([[0.0], np.cumsum(seg)])                  # (n+1,)
+    total = cum[-1]
+    targets = np.linspace(0.0, total, n_target, endpoint=False)
+    j = np.clip(np.searchsorted(cum, targets, side="right") - 1, 0, len(pts) - 1)
+    f = np.where(seg[j] > 1e-12, (targets - cum[j]) / np.where(seg[j] > 1e-12, seg[j], 1.0), 0.0)
+    a = pts[j]
+    b = pts[(j + 1) % len(pts)]
+    return a + f[:, None] * (b - a)
+
+
 def s3_to_r3(pts: np.ndarray) -> np.ndarray:
     """
     Stereographic projection S³ → ℝ³ from north pole N = (0,0,0,1).
@@ -168,6 +296,20 @@ def main() -> None:
                         help="Number of sample points (default: 200)")
     parser.add_argument("--out", type=str, default=".",
                         help="Output directory (default: current directory)")
+    parser.add_argument("--random-walk", action="store_true",
+                        help="Diffuse the knot far from the Clifford torus via a "
+                             "topology-preserving random walk (for convergence-basin tests)")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="RNG seed for --random-walk (default: 0)")
+    parser.add_argument("--walk-steps", type=int, default=120000,
+                        help="Single-vertex moves to attempt (default: 120000)")
+    parser.add_argument("--walk-amp", type=float, default=0.012,
+                        help="Per-move Gaussian noise scale on S³ (default: 0.012)")
+    parser.add_argument("--walk-clearance", type=float, default=0.05,
+                        help="Min non-adjacent segment distance kept during walk (default: 0.05)")
+    parser.add_argument("--upsample-to", type=int, default=None,
+                        help="After the walk, resample to this many points at equal arc "
+                             "length (same knot, finer). Walk cheaply at low --n, densify here.")
     args = parser.parse_args()
 
     if args.p <= 0 or args.q <= 0:
@@ -185,6 +327,14 @@ def main() -> None:
 
     s3_pts = torus_knot_s3(args.p, args.q, args.n)
     r3_pts = s3_to_r3(s3_pts)
+    if args.random_walk:
+        # Walk in R³ on the straight segments knot_check / the .vect actually use.
+        r3_pts = random_walk_knot(r3_pts, args.walk_steps, args.walk_amp,
+                                  args.seed, args.walk_clearance)
+    if args.upsample_to:
+        r3_pts = upsample_r3(r3_pts, args.upsample_to)
+        print(f"  upsampled {len(s3_pts)} → {args.upsample_to} points at equal arc length",
+              file=sys.stderr)
 
     obj_path   = os.path.join(args.out, f"{prefix}.obj")
     vect_path  = os.path.join(args.out, f"{prefix}.vect")
@@ -195,7 +345,7 @@ def main() -> None:
     # scene.txt references the OBJ by filename only (same directory)
     write_scene(r3_pts, scene_path, args.p, args.q, f"{prefix}.obj")
 
-    print(f"T({args.p},{args.q}) knot  —  {args.n} points")
+    print(f"T({args.p},{args.q}) knot  —  {len(r3_pts)} points")
     print(f"  OBJ:   {obj_path}")
     print(f"  VECT:  {vect_path}")
     print(f"  Scene: {scene_path}")

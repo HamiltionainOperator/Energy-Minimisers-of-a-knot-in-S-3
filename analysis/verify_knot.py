@@ -65,12 +65,12 @@ KNOWN: dict = {
     "T(3,4)": {
         "name":      "8_19",
         "signature": -6,
-        "det":       13,
+        "det":        3,   # |Delta(-1)| for T(3,4); Alexander = t^6-t^5+t^3-t+1
     },
     "T(3,5)": {
         "name":      "10_124",
         "signature": -8,
-        "det":        5,
+        "det":        1,   # |Delta(-1)| for T(3,5); Alexander = t^8-t^7+t^5-t^4+t^3-t+1
     },
 }
 
