@@ -1764,11 +1764,15 @@ static void print_dual_energy(const std::string &tag, const std::vector<Real> &v
   Real e_chd = compute_energy_ohara(v4, n, AmbientMetric::Chordal);
   Real ratio = (std::fabs(e_geo) > 1e-9) ? e_chd / e_geo
                                          : std::numeric_limits<Real>::quiet_NaN();
+  Real L     = compute_length(v4, n);
+  Real e_q   = (L > EPS) ? e_geo / (L * L) : 0.0;
   std::cout << std::setprecision(10)
             << "DUAL " << tag << " n=" << n
             << " E_geo=" << e_geo
             << " E_chordal=" << e_chd
-            << " ratio=" << ratio << "\n";
+            << " ratio=" << ratio
+            << " L=" << L
+            << " E_q=" << e_q << "\n";
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1871,6 +1875,30 @@ int main(int argc, char **argv) {
         std::vector<Real> v4(n * 4);
         for (int v = 0; v < n; ++v)
           r3_to_s3(pts_r3.data() + 3 * v, v4.data() + 4 * v);
+        print_dual_energy(argv[k], v4, n);
+      }
+      return 0;
+    }
+    // Same as --eval but the file already holds S³ points (4 columns:
+    // "1\n<n>\n x1 x2 x3 x4 ...").  Avoids the stereographic round trip, which
+    // is ill-conditioned for curves that pass near the projection pole.
+    if (a == "--eval4") {
+      if (i + 1 >= argc) {
+        std::cerr << "Usage: energy_s3 --eval4 <a.s4> [b.s4 ...]\n";
+        return 1;
+      }
+      for (int k = i + 1; k < argc; ++k) {
+        std::ifstream f(argv[k]);
+        if (!f) { std::cerr << "Cannot open: " << argv[k] << "\n"; return 1; }
+        int nc, n;
+        f >> nc >> n;
+        std::vector<Real> v4(n * 4);
+        for (int v = 0; v < n; ++v) {
+          f >> v4[4 * v] >> v4[4 * v + 1] >> v4[4 * v + 2] >> v4[4 * v + 3];
+          Real r = std::sqrt(v4[4 * v] * v4[4 * v] + v4[4 * v + 1] * v4[4 * v + 1]
+                           + v4[4 * v + 2] * v4[4 * v + 2] + v4[4 * v + 3] * v4[4 * v + 3]);
+          for (int c = 0; c < 4; ++c) v4[4 * v + c] /= r;
+        }
         print_dual_energy(argv[k], v4, n);
       }
       return 0;

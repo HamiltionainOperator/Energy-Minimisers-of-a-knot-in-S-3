@@ -1,3 +1,7 @@
 output/
 build/
 .claude/
+.gitignore/
+_3/
+__pycache__/
+notes/ 

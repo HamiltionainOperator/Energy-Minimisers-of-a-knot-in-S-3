@@ -25,6 +25,24 @@ def torus_knot_r3(p, q, n):
     return P
 
 
+def figure8_r3(n):
+    """A figure-eight knot 4_1 in R³, centred at the origin and scaled to unit
+    radius — same normalisation as torus_knot_r3 so it can be a connect-sum
+    component."""
+    P = generate_figure8(n)
+    P -= P.mean(0)
+    P /= np.max(np.linalg.norm(P, axis=1))
+    return P
+
+
+def _component_r3(spec, n):
+    """Build one connect-sum component: a (p,q) tuple → torus knot, 'f8' → 4_1."""
+    if spec == "f8":
+        return figure8_r3(n)
+    p, q = spec
+    return torus_knot_r3(p, q, n)
+
+
 def _hermite(p0, m0, p1, m1, k):
     """k interior points of the cubic Hermite spline p0→p1 with end tangents m0,m1.
 
@@ -81,23 +99,36 @@ def _open_arc(K, toward, gw):
     return K[keep]
 
 
-def connect_sum(specs, n_total):
-    """specs = [(p1,q1), (p2,q2), …]  →  (N,3) closed connect-sum polygon.
+def connect_sum(specs, n_total, layout="row"):
+    """specs = [(p1,q1), 'f8', …]  →  (N,3) closed connect-sum polygon.
 
     Textbook construction: each summand is OPENED by removing a short arc on the
     side facing its neighbour; the consecutive cut ends are joined by short,
     tangent-matched bridges that form a flat, untwisted band (no bow). For each
     join we pick the neighbour's traversal orientation that keeps the two band
     strands from crossing. Finally the loop is resampled to uniform arc length.
+
+    layout='row' places summands along x; the closing bridge then travels back
+    past every intermediate summand, which for M >= 4 crosses strands and breaks
+    the connect sum (e.g. 3^{#4} came out det 189, not 81). layout='ring' places
+    the summands on a circle so EVERY bridge, including the closing one, is a
+    short neighbour-to-neighbour hop. Always verify the construction with
+    analysis/knot_check.py (det = product of summand dets).
     """
     M = len(specs)
     sep = 2.4
     n_each = max(80, int(n_total * 0.85) // M)
     gw = max(1, n_each // 50)                       # half-width of removed arc
     knots = []
-    for i, (p, q) in enumerate(specs):
-        K = torus_knot_r3(p, q, n_each)
-        K[:, 0] += i * sep
+    for i, spec in enumerate(specs):
+        K = _component_r3(spec, n_each)
+        if layout == "ring" and M >= 3:
+            R = sep / (2.0 * np.sin(np.pi / M))
+            th = 2.0 * np.pi * i / M
+            K[:, 0] += R * np.cos(th)
+            K[:, 1] += R * np.sin(th)
+        else:
+            K[:, 0] += i * sep
         knots.append(K)
     centers = [K.mean(0) for K in knots]
 
@@ -132,12 +163,16 @@ def connect_sum(specs, n_total):
 
 
 def parse_spec(s):
-    """'2,3' or '2x3' or '2_3'  →  (2, 3)."""
+    """'2,3' or '2x3' or '2_3'  →  (2, 3); 'f8' / '4_1' → the figure-eight knot."""
+    if s.lower() in ("f8", "fig8", "figure8"):
+        return "f8"
+    if s == "4_1":
+        return "f8"
     for sep in (",", "x", "_"):
         if sep in s:
             a, b = s.split(sep)
             return int(a), int(b)
-    raise argparse.ArgumentTypeError(f"bad torus spec {s!r}; use e.g. 2,3")
+    raise argparse.ArgumentTypeError(f"bad component spec {s!r}; use e.g. 2,3 or f8")
 
 
 def generate_granny_knot(N=5000):
@@ -188,6 +223,9 @@ if __name__ == '__main__':
                         help='named preset (composites or the figure-eight knot)')
     parser.add_argument('--connect', nargs='+', type=parse_spec, metavar='p,q',
                         help='connect-sum of torus knots, e.g. --connect 2,3 2,5')
+    parser.add_argument('--layout', choices=['row', 'ring'], default='row',
+                        help='summand placement; ring keeps every bridge short '
+                             '(needed for 4+ summands)')
     parser.add_argument('--out', type=str, required=True)
     args = parser.parse_args()
 
@@ -197,8 +235,9 @@ if __name__ == '__main__':
     os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
 
     if args.connect:
-        pts = connect_sum(args.connect, args.n)
-        label = " # ".join(f"T({p},{q})" for p, q in args.connect)
+        pts = connect_sum(args.connect, args.n, layout=args.layout)
+        label = " # ".join("4_1" if s == "f8" else f"T({s[0]},{s[1]})"
+                           for s in args.connect)
     elif args.type == 'granny':
         pts = generate_granny_knot(args.n)
         label = 'granny'
