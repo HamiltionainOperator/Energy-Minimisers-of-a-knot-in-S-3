@@ -1,0 +1,8 @@
+This pipeline stands on several excellent open-source projects. Full credit to their authors:
+
+* **[Repulsor](https://github.com/HenrikSchumacher/Repulsor)** — Henrik Schumacher. A header-only C++ library for the generalized tangent-point energy of curves and surfaces. We use its `TangentPointMetric0::Solve` to assemble and apply the **$H^{1/2}$ Sobolev preconditioner** that makes the gradient flow resolution-independent. (Bundled in `Repulsor/`, along with its **Tensors** submodule, also by Henrik Schumacher.) — *MIT License, © 2022 Henrik Schumacher.*
+* **[Repulsive Curves](https://github.com/icethrush/repulsive-curves)** — Christopher Yu, Henrik Schumacher, and Keenan Crane, *"Repulsive Curves,"* ACM Transactions on Graphics (2021). The reference implementation and the tangent-point / Sobolev-descent ideas that inspired this project's optimizer design. (Bundled in `repulsive-curves/`.) — *MIT License, © 2019 Christopher Yu.*
+* **[pyknotid](https://github.com/SPOCKnots/pyknotid)** — Alexander J. Taylor et al. Powers the default `make check`: the robust majority-vote determinant (`analysis/knot_check.py`).
+* **[SnapPy](https://snappy.computop.org/)** — Marc Culler, Nathan M. Dunfield, Matthias Goerner, and Jeffrey R. Weeks. Computes the Alexander/Jones polynomials, signature, determinant, and knot identification used by the optional `make verify` (`analysis/verify_knot.py`, `analysis/knot_invariants.py`).
+
+The mathematical target — the $S^3$ O'Hara energy $E^{(2)}_{S^3}$ and **Conjecture 4.4** (existence of an $E^{\alpha,p}_{S^3}$-minimizer for every knot type at $\alpha p = 2$) — is taken from the source paper that motivates this project.
