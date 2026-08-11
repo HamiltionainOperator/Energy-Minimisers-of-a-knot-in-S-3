@@ -250,6 +250,6 @@ make distclean
 
 # oharas-conjecture-s3
 
-The conjecture (Conjecture 4.4) states that for $\alpha p = 2$, if the knot is embedded in $S^3$, then every knot type admits an $E^{\alpha,p}_{S^3}$ energy minimizer.
+The conjecture states that for $\alpha p = 2$, if the knot is embedded in $S^3$, then every knot type admits an $E^{\alpha,p}_{S^3}$ energy minimizer.
 
 

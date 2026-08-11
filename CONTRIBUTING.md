@@ -5,4 +5,4 @@ This pipeline stands on several excellent open-source projects. Full credit to t
 * **[pyknotid](https://github.com/SPOCKnots/pyknotid)** — Alexander J. Taylor et al. Powers the default `make check`: the robust majority-vote determinant (`analysis/knot_check.py`).
 * **[SnapPy](https://snappy.computop.org/)** — Marc Culler, Nathan M. Dunfield, Matthias Goerner, and Jeffrey R. Weeks. Computes the Alexander/Jones polynomials, signature, determinant, and knot identification used by the optional `make verify` (`analysis/verify_knot.py`, `analysis/knot_invariants.py`).
 
-The mathematical target — the $S^3$ O'Hara energy $E^{(2)}_{S^3}$ and **Conjecture 4.4** (existence of an $E^{\alpha,p}_{S^3}$-minimizer for every knot type at $\alpha p = 2$) — is taken from the source paper that motivates this project.
+The mathematical target — the $S^3$ O'Hara energy $E^{(2)}_{S^3}$ and **Conjecture** (existence of an $E^{\alpha,p}_{S^3}$-minimizer for every knot type at $\alpha p = 2$) — is taken from the source paper that motivates this project.
