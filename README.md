@@ -290,21 +290,3 @@ $L(\gamma_{168})\approx15.3739,$
 
 which lies well inside the observed range.
 
-### Implication for the Bubble Analysis
-
-The relevance of this observation is that a nontrivial bubble would correspond to a loss of compactness through concentration at a vanishing geometric scale. The numerical minimization instead remains at a controlled global length scale and converges toward a single stationary configuration.
-
-Hence, for the trefoil computation, there is no numerical evidence of a nontrivial bubble or of a decomposition of the minimizing configuration into separate concentration components.
-
-This supports
-
-$N((\gamma_n))=0,$
-
-and consequently
-
-$k_*=0$
-
-for the trefoil case considered here.
-
-> **Scope of the numerical claim:** The computation provides evidence for the trefoil case studied here. It is not being presented as a global theorem for every knot class in $S^3$.
-
