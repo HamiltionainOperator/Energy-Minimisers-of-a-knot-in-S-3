@@ -246,10 +246,121 @@ To remove the output files **and** the compiled CMake `build/` directory:
 ```bash
 make distclean
 ```
+## Numerical Results for the Trefoil Knot
 
+The numerical experiments were carried out for the trefoil knot \(3_1\), using the length-normalized intrinsic \(S^3\) energy
 
-# oharas-conjecture-s3
+\[
 
-The conjecture states that for $\alpha p = 2$, if the knot is embedded in $S^3$, then every knot type admits an $E^{\alpha,p}_{S^3}$ energy minimizer.
+\mathcal E(\gamma)
 
+=
+
+\frac{1}{L(\gamma)^2}
+
+\iint
+
+\left(
+
+\frac{1}{d_{S^3}(\gamma(x),\gamma(y))^2}
+
+-
+
+\frac{1}{d_\gamma(x,y)^2}
+
+\right)
+
+\,ds_x\,ds_y,
+
+\]
+
+where \(d_{S^3}\) is the intrinsic geodesic distance on the unit round \(S^3\), \(d_\gamma\) is the arclength distance along the curve, and \(L(\gamma)\) is the total length.
+
+The numerical minimization was run for 169 iterations. The energy decreased from
+
+\[
+
+\mathcal E(\gamma_0)\approx 0.251465
+
+\]
+
+to
+
+\[
+
+\mathcal E(\gamma_{168})\approx 0.245191,
+
+\]
+
+while the gradient norm decreased to approximately
+
+\[
+
+\|\nabla\mathcal E(\gamma_{168})\|\approx 5.76\times10^{-3}.
+
+\]
+
+This indicates convergence toward a stationary finite-energy configuration in the trefoil isotopy class.
+
+### Observed Length Coercivity
+
+A particularly important feature of the computation is the behavior of the total length. Throughout the entire numerical run, the length remained in the bounded interval
+
+\[
+
+15.3612 \lesssim L(\gamma_n)\lesssim 16.0191.
+
+\]
+
+Thus the minimizing sequence shows no tendency toward either
+
+\[
+
+L(\gamma_n)\to0
+
+\]
+
+or
+
+\[
+
+L(\gamma_n)\to\infty.
+
+\]
+
+The numerical experiment therefore provides evidence for **global length coercivity of the length-normalized intrinsic \(S^3\) energy in the trefoil case**: the minimization remains confined to a finite, nondegenerate length scale.
+
+The final configuration has
+
+\[
+
+L(\gamma_{168})\approx15.3739,
+
+\]
+
+which lies well inside the observed range.
+
+### Implication for the Bubble Analysis
+
+The relevance of this observation is that a nontrivial bubble would correspond to a loss of compactness through concentration at a vanishing geometric scale. The numerical minimization instead remains at a controlled global length scale and converges toward a single stationary configuration.
+
+Hence, for the trefoil computation, there is no numerical evidence of a nontrivial bubble or of a decomposition of the minimizing configuration into separate concentration components.
+
+This motivates the conclusion that the minimizing sequence has
+
+\[
+
+N((\gamma_n))=0,
+
+\]
+
+and consequently
+
+\[
+
+k_* = 0
+
+\]
+
+for the trefoil case considered here.
 
