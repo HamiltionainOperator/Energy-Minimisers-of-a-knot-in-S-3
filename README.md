@@ -290,3 +290,7 @@ $L(\gamma_{168})\approx15.3739,$
 
 which lies well inside the observed range.
 
+## Results
+
+The numerical results show that the energy is length corecive from both the ends , for 
+$ L \to 0$ it's very clear but when we take the energy to be $L \to \infty$ the energy behaves like $\log L$ where L is the length.
